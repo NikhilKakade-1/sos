@@ -38,10 +38,10 @@ class Apache(Plugin):
     def setup(self):
         # collect list of installed modules and verify config syntax.
         self.add_cmd_output([
-            "apachectl -M",
             "apachectl -S",
             "apachectl -t"
         ], cmd_as_tag=True)
+        self.add_cmd_output("apachectl -M", tags="httpd_M")
 
         # Other plugins collect these files;
         # do not collect them here to avoid collisions in the archive paths.
@@ -50,9 +50,12 @@ class Apache(Plugin):
             'ceilometer',
             'cinder',
             'foreman',
+            'gnocchi',
             'horizon',
             'keystone',
+            'manila',
             'nova',
+            'octavia',
             'placement',
             'pulp'
         ]
@@ -81,10 +84,10 @@ class RedHatApache(Apache, RedHatPlugin):
     def setup(self):
 
         self.add_file_tags({
-            ".*/access_log": 'httpd_access_log',
-            ".*/error_log": 'httpd_error_log',
-            ".*/ssl_access_log": 'httpd_ssl_access_log',
-            ".*/ssl_error_log": 'httpd_ssl_error_log'
+            "/var/log/httpd/access_log": 'httpd_access_log',
+            "/var/log/httpd/error_log": 'httpd_error_log',
+            "/var/log/httpd/ssl_access_log": 'httpd_ssl_access_log',
+            "/var/log/httpd/ssl_error_log": 'httpd_ssl_error_log'
         })
 
         super(RedHatApache, self).setup()
@@ -96,7 +99,7 @@ class RedHatApache(Apache, RedHatPlugin):
         # relevant config files within each
         etcdirs = ["/etc/httpd%s" % ver for ver in vers]
         confs = [
-            "conf/httpd.conf",
+            "conf/*.conf",
             "conf.d/*.conf",
             "conf.modules.d/*.conf"
         ]
@@ -131,7 +134,7 @@ class RedHatApache(Apache, RedHatPlugin):
 
 class DebianApache(Apache, DebianPlugin, UbuntuPlugin):
     files = ('/etc/apache2/apache2.conf',)
-    apachepkg = 'apache'
+    apachepkg = 'apache2'
 
     def setup(self):
         super(DebianApache, self).setup()
@@ -144,10 +147,15 @@ class DebianApache(Apache, DebianPlugin, UbuntuPlugin):
 
         # collect only the current log set by default
         self.add_copy_spec([
-            "/var/log/apache2/access_log",
-            "/var/log/apache2/error_log",
+            "/var/log/apache2/access.log",
+            "/var/log/apache2/error.log",
+            "/var/log/apache2/ssl_access.log",
+            "/var/log/apache2/ssl_error.log",
+            "/var/log/apache2/other_vhosts_access.log",
         ])
         if self.get_option("log") or self.get_option("all_logs"):
-            self.add_copy_spec("/var/log/apache2/*")
+            self.add_copy_spec([
+                "/var/log/apache2",
+            ])
 
 # vim: set et ts=4 sw=4 :

@@ -39,8 +39,9 @@ class SoSMap():
         if not item or item in self.skip_keys or item in self.dataset.values():
             return True
         for skip in self.ignore_matches:
-            if re.match(skip, item):
+            if re.match(skip, item, re.I):
                 return True
+        return False
 
     def add(self, item):
         """Add a particular item to the map, generating an obfuscated pair
@@ -94,7 +95,7 @@ class SoSMap():
         :returns:       A compiled regex pattern for the item
         :rtype:         ``re.Pattern``
         """
-        return re.compile(item, re.I)
+        return re.compile(re.escape(item), re.I)
 
     def sanitize_item(self, item):
         """Perform the obfuscation relevant to the item being added to the map.

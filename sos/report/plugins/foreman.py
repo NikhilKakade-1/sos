@@ -25,8 +25,8 @@ class Foreman(Plugin):
     profiles = ('sysmgmt',)
     packages = ('foreman',)
     option_list = [
-        PluginOpt('months', default=1,
-                  desc='number of months for dynflow output'),
+        PluginOpt('days', default=14,
+                  desc='number of days for dynflow output'),
         PluginOpt('proxyfeatures', default=False,
                   desc='collect features of smart proxies'),
         PluginOpt('puma-gc', default=False,
@@ -43,7 +43,9 @@ class Foreman(Plugin):
         self.dbhost = "localhost"
         self.dbpasswd = ""
         try:
-            for line in open("/etc/foreman/database.yml").read().splitlines():
+            with open('/etc/foreman/database.yml', 'r') as dfile:
+                foreman_lines = dfile.read().splitlines()
+            for line in foreman_lines:
                 # skip empty lines and lines with comments
                 if not line or line[0] == '#':
                     continue
@@ -72,7 +74,9 @@ class Foreman(Plugin):
         self.add_file_tags({
             '/var/log/foreman/production.log.*': 'foreman_production_log',
             '/etc/sysconfig/foreman-tasks': 'foreman_tasks_config',
-            '/etc/sysconfig/dynflowd': 'foreman_tasks_config'
+            '/etc/sysconfig/dynflowd': 'foreman_tasks_config',
+            '/var/log/httpd/foreman-ssl_access_ssl.log':
+                'foreman_ssl_access_ssl_log'
         })
 
         self.add_forbidden_path([
@@ -118,7 +122,6 @@ class Foreman(Plugin):
         ])
 
         self.add_cmd_output([
-            'hammer ping',
             'foreman-selinux-relabel -nv',
             'passenger-status --show pool',
             'passenger-status --show requests',
@@ -130,6 +133,14 @@ class Foreman(Plugin):
             'ping -c1 -W1 %s' % _host_f,
             'ping -c1 -W1 localhost'
         ])
+        self.add_cmd_output(
+            'qpid-stat -b amqps://localhost:5671 -q \
+                    --ssl-certificate=/etc/pki/katello/qpid_router_client.crt \
+                    --ssl-key=/etc/pki/katello/qpid_router_client.key \
+                    --sasl-mechanism=ANONYMOUS',
+            suggest_filename='qpid-stat_-q'
+        )
+        self.add_cmd_output("hammer ping", tags="hammer_ping")
 
         # Dynflow Sidekiq
         self.add_cmd_output('systemctl list-units dynflow*',
@@ -168,9 +179,9 @@ class Foreman(Plugin):
         self.add_cmd_output(_cmd, suggest_filename='foreman_db_tables_sizes',
                             env=self.env)
 
-        months = '%s months' % self.get_option('months')
+        days = '%s days' % self.get_option('days')
 
-        # Construct the DB queries, using the months option to limit the range
+        # Construct the DB queries, using the days option to limit the range
         # of entries returned
 
         scmd = (
@@ -179,7 +190,7 @@ class Foreman(Plugin):
         )
 
         authcmd = (
-            'select type,name,host,port,account,base_dn,attr_login,'
+            'select id,type,name,host,port,account,base_dn,attr_login,'
             'onthefly_register,tls from auth_sources'
         )
 
@@ -187,7 +198,7 @@ class Foreman(Plugin):
             'select dynflow_execution_plans.* from foreman_tasks_tasks join '
             'dynflow_execution_plans on (foreman_tasks_tasks.external_id = '
             'dynflow_execution_plans.uuid::varchar) where foreman_tasks_tasks.'
-            'started_at > NOW() - interval %s' % quote(months)
+            'started_at > NOW() - interval %s' % quote(days)
         )
 
         dactioncmd = (
@@ -195,7 +206,7 @@ class Foreman(Plugin):
              'dynflow_actions on (foreman_tasks_tasks.external_id = '
              'dynflow_actions.execution_plan_uuid::varchar) where '
              'foreman_tasks_tasks.started_at > NOW() - interval %s'
-             % quote(months)
+             % quote(days)
         )
 
         dstepscmd = (
@@ -203,7 +214,7 @@ class Foreman(Plugin):
             'dynflow_steps on (foreman_tasks_tasks.external_id = '
             'dynflow_steps.execution_plan_uuid::varchar) where '
             'foreman_tasks_tasks.started_at > NOW() - interval %s'
-            % quote(months)
+            % quote(days)
         )
 
         # counts of fact_names prefixes/types: much of one type suggests
@@ -221,6 +232,7 @@ class Foreman(Plugin):
 
         foremandb = {
             'foreman_settings_table': scmd,
+            'foreman_schema_migrations': 'select * from schema_migrations',
             'foreman_auth_table': authcmd,
             'dynflow_schema_info': 'select * from dynflow_schema_info',
             'audits_table_count': 'select count(*) from audits',
@@ -294,10 +306,6 @@ class Foreman(Plugin):
 
     def postproc(self):
         self.do_path_regex_sub(
-            "/var/log/%s*/foreman-ssl_access_ssl.log*" % self.apachepkg,
-            r"(.*\?(passw|cred|token|secret|key).*=)(.*) (HTTP.*(.*))",
-            r"\1******** \4")
-        self.do_path_regex_sub(
             r"/etc/foreman/(.*)((conf)(.*)?)",
             r"((\:|\s*)(passw|cred|token|secret|key).*(\:\s|=))(.*)",
             r"\1********")
@@ -326,8 +334,7 @@ class RedHatForeman(Foreman, SCLPlugin, RedHatPlugin):
             self.pumactl = "scl enable tfm '%s'" % self.pumactl
 
         super(RedHatForeman, self).setup()
-        self.add_cmd_output_scl('tfm', 'gem list',
-                                suggest_filename='scl enable tfm gem list')
+        self.add_cmd_output('gem list')
 
 
 class DebianForeman(Foreman, DebianPlugin, UbuntuPlugin):

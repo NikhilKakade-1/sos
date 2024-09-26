@@ -46,16 +46,31 @@ class Filesys(Plugin, DebianPlugin, UbuntuPlugin, CosPlugin):
             "/etc/mtab",
             "/etc/fstab"
         ])
-        self.add_cmd_output("mount -l", root_symlink="mount")
+        self.add_cmd_output("mount -l", root_symlink="mount",
+                            tags="mount")
         self.add_cmd_output("df -al -x autofs", root_symlink="df",
-                            tags='insights_df__al')
+                            tags='df__al')
         self.add_cmd_output([
             "df -ali -x autofs",
             "findmnt",
             "lslocks"
         ])
 
-        self.add_forbidden_path('/proc/fs/panfs')
+        self.add_forbidden_path([
+            # cifs plugin
+            '/proc/fs/cifs',
+            # lustre plugin
+            '/proc/fs/ldiskfs',
+            '/proc/fs/lustre',
+            # nfs plugin
+            '/proc/fs/nfsd',
+            '/proc/fs/nfsfs',
+            # panfs (from Panasas company) provides statistics which can be
+            # very large (100s of GB)
+            '/proc/fs/panfs',
+            # xfs plugin
+            '/proc/fs/xfs'
+        ])
 
         if self.get_option('lsof'):
             self.add_cmd_output("lsof -b +M -n -l -P", root_symlink="lsof",
@@ -67,7 +82,8 @@ class Filesys(Plugin, DebianPlugin, UbuntuPlugin, CosPlugin):
         mounts = '/proc/mounts'
         ext_fs_regex = r"^(/dev/\S+).+ext[234]\s+"
         for dev in self.do_regex_find_all(ext_fs_regex, mounts):
-            self.add_cmd_output("dumpe2fs %s %s" % (dumpe2fs_opts, dev))
+            self.add_cmd_output("dumpe2fs %s %s" % (dumpe2fs_opts, dev),
+                                tags="dumpe2fs_h")
 
             if self.get_option('frag'):
                 self.add_cmd_output("e2freefrag %s" % (dev), priority=100)

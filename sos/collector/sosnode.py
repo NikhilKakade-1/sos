@@ -14,22 +14,26 @@ import logging
 import os
 import re
 
-from distutils.version import LooseVersion
 from pipes import quote
 from sos.policies import load
 from sos.policies.init_systems import InitSystem
+from sos.collector.transports.juju import JujuSSH
 from sos.collector.transports.control_persist import SSHControlPersist
 from sos.collector.transports.local import LocalTransport
 from sos.collector.transports.oc import OCTransport
+from sos.collector.transports.saltstack import SaltStackMaster
 from sos.collector.exceptions import (CommandTimeoutException,
                                       ConnectionException,
                                       UnsupportedHostException,
                                       InvalidTransportException)
+from sos.utilities import parse_version
 
 TRANSPORTS = {
     'local': LocalTransport,
     'control_persist': SSHControlPersist,
-    'oc': OCTransport
+    'oc': OCTransport,
+    'saltstack': SaltStackMaster,
+    'juju': JujuSSH,
 }
 
 
@@ -44,6 +48,7 @@ class SosNode():
         self.tmpdir = commons['tmpdir']
         self.hostlen = commons['hostlen']
         self.need_sudo = commons['need_sudo']
+        self.sos_options = commons['sos_options']
         self.local = False
         self.host = None
         self.cluster = None
@@ -72,6 +77,10 @@ class SosNode():
         self.soslog = logging.getLogger('sos')
         self.ui_log = logging.getLogger('sos_ui')
         self._transport = self._load_remote_transport(commons)
+        # Overwrite need_sudo if transports default_user
+        # is set and is not root.
+        if self._transport.default_user:
+            self.need_sudo = self._transport.default_user != 'root'
         try:
             self._transport.connect(self._password)
         except Exception as err:
@@ -204,6 +213,7 @@ class SosNode():
                 self.log_error("Could not create container on host: %s"
                                % res['output'])
                 raise Exception
+        return False
 
     def get_container_auth(self):
         """Determine what the auth string should be to pull the image used to
@@ -294,7 +304,7 @@ class SosNode():
         if ver:
             if len(ver.split('.')) == 2:
                 # safeguard against maintenance releases throwing off the
-                # comparison by LooseVersion
+                # comparison by parse_version
                 ver += '.0'
             try:
                 ver += '-%s' % rel.split('.')[0]
@@ -322,6 +332,7 @@ class SosNode():
             self._load_sos_plugins(sosinfo['output'])
         if self.check_sos_version('3.6'):
             self._load_sos_presets()
+        return None
 
     def _load_sos_presets(self):
         cmd = '%s --list-presets' % self.sos_bin
@@ -382,7 +393,7 @@ class SosNode():
             return self.commons['policy']
         host = load(cache={}, sysroot=self.opts.sysroot, init=InitSystem(),
                     probe_runtime=True,
-                    remote_exec=self._transport.remote_exec,
+                    remote_exec=self._transport.run_command,
                     remote_check=self.read_file('/etc/os-release'))
         if host:
             self.log_info("loaded policy %s for host" % host.distro)
@@ -419,8 +430,8 @@ class SosNode():
         _ver = _format_version(ver)
 
         try:
-            _node_ver = LooseVersion(self.sos_info['version'])
-            _test_ver = LooseVersion(_ver)
+            _node_ver = parse_version(self.sos_info['version'])
+            _test_ver = parse_version(_ver)
             return _node_ver >= _test_ver
         except Exception as err:
             self.log_error("Error checking sos version: %s" % err)
@@ -432,20 +443,25 @@ class SosNode():
             return False
         return self.host.package_manager.pkg_by_name(pkg) is not None
 
-    def run_command(self, cmd, timeout=180, get_pty=False, need_root=False,
+    def run_command(self, cmd, timeout=180, use_shell='auto', need_root=False,
                     use_container=False, env=None):
         """Runs a given cmd, either via the SSH session or locally
 
-        Arguments:
-            cmd - the full command to be run
-            timeout - time in seconds to wait for the command to complete
-            get_pty - If a shell is absolutely needed to run a command, set
-                      this to True
-            need_root - if a command requires root privileges, setting this to
-                        True tells sos-collector to format the command with
-                        sudo or su - as appropriate and to input the password
-            use_container - Run this command in a container *IF* the host is
-                            containerized
+        :param cmd:     The full command to be run
+        :type cmd:      ``str``
+
+        :param timeout: Time in seconds to wait for `cmd` to complete
+        :type timeout:  ``int``
+
+        :param use_shell: If a shell is needed to run `cmd`, set to True
+        :type use_shell:  ``bool`` or ``auto`` for transport-determined
+
+        :param use_container: Run this command in a container *IF* the host
+                              is a containerized host
+        :type use_container: ``bool``
+
+        :param env: Pass environment variables to set for this `cmd`
+        :type env:  ``dict``
         """
         if not self.connected and not self.local:
             self.log_debug('Node is disconnected, attempting to reconnect')
@@ -461,15 +477,11 @@ class SosNode():
             cmd = self.host.format_container_command(cmd)
         if need_root:
             cmd = self._format_cmd(cmd)
-
-        if 'atomic' in cmd:
-            get_pty = True
-
         if env:
             _cmd_env = self.env_vars
             env = _cmd_env.update(env)
         return self._transport.run_command(cmd, timeout, need_root, env,
-                                           get_pty)
+                                           use_shell)
 
     def sosreport(self):
         """Run an sos report on the node, then collect it"""
@@ -550,6 +562,12 @@ class SosNode():
                 if plug not in self.enable_plugins:
                     self.enable_plugins.append(plug)
 
+        if self.cluster.sos_options:
+            for opt in self.cluster.sos_options:
+                # take the user specification over any cluster defaults
+                if opt not in self.sos_options:
+                    self.sos_options[opt] = self.cluster.sos_options[opt]
+
         if self.cluster.sos_plugin_options:
             for opt in self.cluster.sos_plugin_options:
                 if not any(opt in o for o in self.plugopts):
@@ -583,9 +601,6 @@ class SosNode():
         label = self.determine_sos_label()
         if label:
             sos_cmd = '%s %s ' % (sos_cmd, quote(label))
-
-        if self.opts.sos_opt_line:
-            return '%s %s' % (sos_cmd, self.opts.sos_opt_line)
 
         sos_opts = []
 
@@ -634,6 +649,16 @@ class SosNode():
                 sos_opts.append(
                     "--container-runtime=%s" % self.opts.container_runtime
                 )
+            if self.opts.namespaces:
+                sos_opts.append(
+                    "--namespaces=%s" % self.opts.namespaces
+                )
+
+        if self.check_sos_version('4.5.2'):
+            if self.opts.journal_size:
+                sos_opts.append(f"--journal-size={self.opts.journal_size}")
+            if self.opts.low_priority:
+                sos_opts.append('--low-priority')
 
         self.update_cmd_from_cluster()
 
@@ -641,6 +666,10 @@ class SosNode():
             'sosreport',
             os.path.join(self.host.sos_bin_path, self.sos_bin)
         )
+
+        for opt in self.sos_options:
+            _val = self.sos_options[opt]
+            sos_opts.append(f"--{opt} {_val if _val else ''}")
 
         if self.plugopts:
             opts = [o for o in self.plugopts
@@ -751,7 +780,8 @@ class SosNode():
             checksum = False
             res = self.run_command(self.sos_cmd,
                                    timeout=self.opts.timeout,
-                                   get_pty=True, need_root=True,
+                                   use_shell=True,
+                                   need_root=True,
                                    use_container=True,
                                    env=self.sos_env_vars)
             if res['status'] == 0:
@@ -782,8 +812,9 @@ class SosNode():
         except CommandTimeoutException:
             self.log_error('Timeout exceeded')
             raise
-        except Exception as e:
-            self.log_error('Error running sos report: %s' % e)
+        except Exception as err:
+            self.log_info(f"Exception during sos report execution: {err}")
+            self.ui_msg(f"Error running sos report: {err}")
             raise
 
     def retrieve_file(self, path):

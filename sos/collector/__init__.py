@@ -80,6 +80,7 @@ class SoSCollector(SoSComponent):
         'cluster_type': None,
         'container_runtime': 'auto',
         'domains': [],
+        'disable_parsers': [],
         'enable_plugins': [],
         'encrypt_key': '',
         'encrypt_pass': '',
@@ -87,12 +88,14 @@ class SoSCollector(SoSComponent):
         'image': '',
         'force_pull_image': True,
         'jobs': 4,
+        'journal_size': 0,
         'keywords': [],
         'keyword_file': None,
         'keep_binary_files': False,
         'label': '',
         'list_options': False,
         'log_size': 0,
+        'low_priority': False,
         'map_file': '/etc/sos/cleaner/default_mapping',
         'primary': '',
         'namespaces': None,
@@ -117,7 +120,6 @@ class SoSCollector(SoSComponent):
         'skip_commands': [],
         'skip_files': [],
         'skip_plugins': [],
-        'sos_opt_line': '',
         'ssh_key': '',
         'ssh_port': 22,
         'ssh_user': 'root',
@@ -132,7 +134,13 @@ class SoSCollector(SoSComponent):
         'upload_pass': None,
         'upload_method': 'auto',
         'upload_no_ssl_verify': False,
-        'upload_protocol': 'auto'
+        'upload_protocol': 'auto',
+        'upload_s3_endpoint': None,
+        'upload_s3_region': None,
+        'upload_s3_bucket': None,
+        'upload_s3_access_key': None,
+        'upload_s3_secret_key': None,
+        'upload_s3_object_prefix': None
     }
 
     def __init__(self, parser, parsed_args, cmdline_args):
@@ -235,7 +243,12 @@ class SoSCollector(SoSComponent):
     def _import_modules(self, modname):
         """Import and return all found classes in a module"""
         mod_short_name = modname.split('.')[2]
-        module = __import__(modname, globals(), locals(), [mod_short_name])
+        try:
+            module = __import__(modname, globals(), locals(), [mod_short_name])
+        except ImportError as e:
+            print(f'Error while trying to load module {modname}: '
+                  f' {e.__class__.__name__}')
+            raise e
         modules = inspect.getmembers(module, inspect.isclass)
         for mod in modules:
             if mod[0] in ('SosHost', 'Cluster'):
@@ -300,11 +313,16 @@ class SoSCollector(SoSComponent):
                                   "collections. 'auto' for policy control.")
         sos_grp.add_argument('-e', '--enable-plugins', action="extend",
                              help='Enable specific plugins for sosreport')
+        sos_grp.add_argument('--journal-size', type=int, default=0,
+                             help='Limit the size of journals in MiB')
         sos_grp.add_argument('-k', '--plugin-option', '--plugopts',
                              action="extend", dest='plugopts',
                              help='Plugin option as plugname.option=value')
         sos_grp.add_argument('--log-size', default=0, type=int,
-                             help='Limit the size of individual logs (in MiB)')
+                             help='Limit the size of individual logs '
+                                  '(not journals) in MiB')
+        sos_grp.add_argument('--low-priority', action='store_true',
+                             default=False, help='Run reports as low priority')
         sos_grp.add_argument('-n', '--skip-plugins', action="extend",
                              help='Skip these plugins')
         sos_grp.add_argument('-o', '--only-plugins', action="extend",
@@ -403,9 +421,6 @@ class SoSCollector(SoSComponent):
                                  help='Prompt for password for each node')
         collect_grp.add_argument('--preset', default='', required=False,
                                  help='Specify a sos preset to use')
-        collect_grp.add_argument('--sos-cmd', dest='sos_opt_line',
-                                 help=('Manually specify the commandline '
-                                       'for sos report on nodes'))
         collect_grp.add_argument('--ssh-user',
                                  help='Specify an SSH user. Default root')
         collect_grp.add_argument('--timeout', type=int, required=False,
@@ -431,8 +446,21 @@ class SoSCollector(SoSComponent):
                                  action='store_true',
                                  help="Disable SSL verification for upload url"
                                  )
+        collect_grp.add_argument("--upload-s3-endpoint", default=None,
+                                 help="Endpoint to upload to for S3 bucket")
+        collect_grp.add_argument("--upload-s3-region", default=None,
+                                 help="Region for the S3 bucket")
+        collect_grp.add_argument("--upload-s3-bucket", default=None,
+                                 help="Name of the S3 bucket to upload to")
+        collect_grp.add_argument("--upload-s3-access-key", default=None,
+                                 help="Access key for the S3 bucket")
+        collect_grp.add_argument("--upload-s3-secret-key", default=None,
+                                 help="Secret key for the S3 bucket")
+        collect_grp.add_argument("--upload-s3-object-prefix", default=None,
+                                 help="Prefix for the S3 object/key")
         collect_grp.add_argument("--upload-protocol", default='auto',
-                                 choices=['auto', 'https', 'ftp', 'sftp'],
+                                 choices=['auto', 'https', 'ftp', 'sftp',
+                                          's3'],
                                  help="Manually specify the upload protocol")
 
         # Group the cleaner options together
@@ -451,6 +479,10 @@ class SoSCollector(SoSComponent):
         cleaner_grp.add_argument('--domains', dest='domains', default=[],
                                  action='extend',
                                  help='Additional domain names to obfuscate')
+        cleaner_grp.add_argument('--disable-parsers', action='extend',
+                                 default=[], dest='disable_parsers',
+                                 help=('Disable specific parsers, so that '
+                                       'those elements are not obfuscated'))
         cleaner_grp.add_argument('--keywords', action='extend', default=[],
                                  dest='keywords',
                                  help='List of keywords to obfuscate')
@@ -488,17 +520,35 @@ class SoSCollector(SoSComponent):
                 newline=False
             )
 
-    def exit(self, msg, error=1):
-        """Used to safely terminate if sos-collector encounters an error"""
+    def exit(self, msg=None, error=0, force=False):
+        """Used to terminate and ensure all cleanup is done, setting the exit
+        code as specified if required.
+
+        :param msg:     Log the provided message as an error
+        :type msg:      ``str``
+
+        :param error:   The exit code to use when terminating
+        :type error:    ``int``
+
+        :param force:   Use os.exit() to break out of nested threads if needed
+        :type force:    ``bool``
+        """
         if self.cluster:
             self.cluster.cleanup()
-        self.log_error(msg)
+        if msg:
+            self.log_error(msg)
         try:
             self.close_all_connections()
         except Exception:
             pass
-        self.cleanup()
-        sys.exit(error)
+        if error != 130:
+            # keep the tempdir around when a user issues a keyboard interrupt
+            # like we do for report
+            self.cleanup()
+        if not force:
+            sys.exit(error)
+        else:
+            os._exit(error)
 
     def _parse_options(self):
         """From commandline options, defaults, etc... build a set of commons
@@ -546,7 +596,7 @@ class SoSCollector(SoSComponent):
                             break
             if not match:
                 self.exit('Unknown cluster option provided: %s.%s'
-                          % (opt.cluster, opt.name))
+                          % (opt.cluster, opt.name), 1)
 
     def _validate_option(self, default, cli):
         """Checks to make sure that the option given on the CLI is valid.
@@ -559,19 +609,20 @@ class SoSCollector(SoSComponent):
         if not default.opt_type == bool:
             if not default.opt_type == cli.opt_type:
                 msg = "Invalid option type for %s. Expected %s got %s"
-                self.exit(msg % (cli.name, default.opt_type, cli.opt_type))
+                self.exit(msg % (cli.name, default.opt_type, cli.opt_type), 1)
             return cli.value
         else:
             val = cli.value.lower()
             if val not in ['true', 'on', 'yes', 'false', 'off', 'no']:
                 msg = ("Invalid value for %s. Accepted values are: 'true', "
                        "'false', 'on', 'off', 'yes', 'no'.")
-                self.exit(msg % cli.name)
+                self.exit(msg % cli.name, 1)
             else:
                 if val in ['true', 'on', 'yes']:
                     return True
                 else:
                     return False
+        self.exit(f"Unknown option type: {cli.opt_type}")
 
     def log_info(self, msg):
         """Log info messages to both console and log file"""
@@ -579,7 +630,7 @@ class SoSCollector(SoSComponent):
 
     def log_warn(self, msg):
         """Log warn messages to both console and log file"""
-        self.soslog.warn(msg)
+        self.soslog.warning(msg)
 
     def log_error(self, msg):
         """Log error messages to both console and log file"""
@@ -732,7 +783,7 @@ class SoSCollector(SoSComponent):
         fname = os.path.join(group_path, cfg['name'])
         with open(fname, 'w') as hf:
             json.dump(cfg, hf)
-        os.chmod(fname, 0o644)
+        os.chmod(fname, 0o600)
         return fname
 
     def prep(self):
@@ -744,26 +795,29 @@ class SoSCollector(SoSComponent):
                    'nodes unless the --password option is provided.\n')
             self.ui_log.info(self._fmt_msg(msg))
 
-        if ((self.opts.password or (self.opts.password_per_node and
-                                    self.opts.primary))
-                and not self.opts.batch):
-            self.log_debug('password specified, not using SSH keys')
-            msg = ('Provide the SSH password for user %s: '
-                   % self.opts.ssh_user)
-            self.opts.password = getpass(prompt=msg)
-
-        if ((self.commons['need_sudo'] and not self.opts.nopasswd_sudo)
-                and not self.opts.batch):
-            if not self.opts.password and not self.opts.password_per_node:
-                self.log_debug('non-root user specified, will request '
-                               'sudo password')
-                msg = ('A non-root user has been provided. Provide sudo '
-                       'password for %s on remote nodes: '
+        try:
+            if ((self.opts.password or (self.opts.password_per_node and
+                                        self.opts.primary))
+                    and not self.opts.batch):
+                self.log_debug('password specified, not using SSH keys')
+                msg = ('Provide the SSH password for user %s: '
                        % self.opts.ssh_user)
-                self.opts.sudo_pw = getpass(prompt=msg)
-            else:
-                if not self.opts.nopasswd_sudo:
-                    self.opts.sudo_pw = self.opts.password
+                self.opts.password = getpass(prompt=msg)
+
+            if ((self.commons['need_sudo'] and not self.opts.nopasswd_sudo)
+                    and not self.opts.batch):
+                if not self.opts.password and not self.opts.password_per_node:
+                    self.log_debug('non-root user specified, will request '
+                                   'sudo password')
+                    msg = ('A non-root user has been provided. Provide sudo '
+                           'password for %s on remote nodes: '
+                           % self.opts.ssh_user)
+                    self.opts.sudo_pw = getpass(prompt=msg)
+                else:
+                    if not self.opts.nopasswd_sudo:
+                        self.opts.sudo_pw = self.opts.password
+        except KeyboardInterrupt:
+            self.exit("\nExiting on user cancel\n", 130)
 
         if self.opts.become_root:
             if not self.opts.ssh_user == 'root':
@@ -786,11 +840,14 @@ class SoSCollector(SoSComponent):
             try:
                 self._load_group_config()
             except Exception as err:
-                self.log_error("Could not load specified group %s: %s"
-                               % (self.opts.group, err))
-                self._exit(1)
+                msg = ("Could not load specified group %s: %s"
+                       % (self.opts.group, err))
+                self.exit(msg, 1)
 
-        self.policy.pre_work()
+        try:
+            self.policy.pre_work()
+        except KeyboardInterrupt:
+            self.exit("Exiting on user cancel\n", 130)
 
         if self.opts.primary:
             self.connect_to_primary()
@@ -885,11 +942,12 @@ class SoSCollector(SoSComponent):
 
         if not self.node_list and not self.primary.connected:
             self.exit('No nodes were detected, or nodes do not have sos '
-                      'installed.\nAborting...')
+                      'installed.\nAborting...', 1)
 
         self.ui_log.info('The following is a list of nodes to collect from:')
         if self.primary.connected and self.primary.hostname is not None:
-            if not (self.primary.local and self.opts.no_local):
+            if not ((self.primary.local and self.opts.no_local)
+                    or self.cluster.strict_node_list):
                 self.ui_log.info('\t%-*s' % (self.commons['hostlen'],
                                              self.primary.hostname))
 
@@ -909,42 +967,34 @@ class SoSCollector(SoSComponent):
 
     def configure_sos_cmd(self):
         """Configures the sosreport command that is run on the nodes"""
-        self.sos_cmd = 'sosreport --batch '
-        if self.opts.sos_opt_line:
-            filt = ['&', '|', '>', '<', ';']
-            if any(f in self.opts.sos_opt_line for f in filt):
-                self.log_warn('Possible shell script found in provided sos '
-                              'command. Ignoring --sos-opt-line entirely.')
-                self.opts.sos_opt_line = None
-            else:
-                self.sos_cmd = '%s %s' % (
-                    self.sos_cmd, quote(self.opts.sos_opt_line))
-                self.log_debug("User specified manual sosreport command. "
-                               "Command set to %s" % self.sos_cmd)
-                return True
+        sos_cmd = 'sosreport --batch '
 
-        sos_opts = []
+        sos_options = {}
 
         if self.opts.case_id:
-            sos_opts.append('--case-id=%s' % (quote(self.opts.case_id)))
+            sos_options['case-id'] = quote(self.opts.case_id)
         if self.opts.alloptions:
-            sos_opts.append('--alloptions')
+            sos_options['alloptions'] = ''
         if self.opts.all_logs:
-            sos_opts.append('--all-logs')
+            sos_options['all-logs'] = ''
         if self.opts.verify:
-            sos_opts.append('--verify')
+            sos_options['verify'] = ''
         if self.opts.log_size:
-            sos_opts.append(('--log-size=%s' % quote(str(self.opts.log_size))))
+            sos_options['log-size'] = quote(str(self.opts.log_size))
         if self.opts.sysroot:
-            sos_opts.append('-s %s' % quote(self.opts.sysroot))
+            sos_options['sysroot'] = quote(self.opts.sysroot)
         if self.opts.chroot:
-            sos_opts.append('-c %s' % quote(self.opts.chroot))
+            sos_options['chroot'] = quote(self.opts.chroot)
         if self.opts.compression_type != 'auto':
-            sos_opts.append('-z %s' % (quote(self.opts.compression_type)))
-        self.sos_cmd = self.sos_cmd + ' '.join(sos_opts)
-        self.log_debug("Initial sos cmd set to %s" % self.sos_cmd)
-        self.commons['sos_cmd'] = self.sos_cmd
-        self.collect_md.add_field('initial_sos_cmd', self.sos_cmd)
+            sos_options['compression-type'] = quote(self.opts.compression_type)
+
+        for k, v in sos_options.items():
+            sos_cmd += f"--{k} {v} "
+        sos_cmd = sos_cmd.rstrip()
+        self.log_debug(f"Initial sos cmd set to {sos_cmd}")
+        self.commons['sos_cmd'] = 'sosreport --batch '
+        self.commons['sos_options'] = sos_options
+        self.collect_md.add_field('initial_sos_cmd', sos_cmd)
 
     def connect_to_primary(self):
         """If run with --primary, we will run cluster checks again that
@@ -1009,12 +1059,13 @@ class SoSCollector(SoSComponent):
         if applicable"""
         if (self.hostname in self.node_list and self.opts.no_local):
             self.node_list.remove(self.hostname)
-        for i in self.ip_addrs:
-            if i in self.node_list:
-                self.node_list.remove(i)
+        if not self.cluster.strict_node_list:
+            for i in self.ip_addrs:
+                if i in self.node_list:
+                    self.node_list.remove(i)
         # remove the primary node from the list, since we already have
         # an open session to it.
-        if self.primary is not None:
+        if self.primary is not None and not self.cluster.strict_node_list:
             for n in self.node_list:
                 if n == self.primary.hostname or n == self.opts.primary:
                     self.node_list.remove(n)
@@ -1041,7 +1092,7 @@ class SoSCollector(SoSComponent):
             msg = ('Could not determine a cluster type and no list of '
                    'nodes or primary node was provided.\nAborting...'
                    )
-            self.exit(msg)
+            self.exit(msg, 1)
 
         try:
             nodes = self.get_nodes_from_cluster()
@@ -1136,13 +1187,12 @@ this utility or remote systems that it connects to.
             except KeyboardInterrupt:
                 self.exit("Exiting on user cancel", 130)
             except Exception as e:
-                self._exit(1, e)
+                self.exit(e, 1)
 
     def execute(self):
         if self.opts.list_options:
             self.list_options()
-            self.cleanup()
-            raise SystemExit
+            self.exit()
 
         self.intro()
 
@@ -1156,17 +1206,23 @@ this utility or remote systems that it connects to.
         self.archive.makedirs('sos_logs', 0o755)
 
         self.collect()
-        self.cluster.cleanup()
-        self.cleanup()
+        self.exit()
 
     def collect(self):
         """ For each node, start a collection thread and then tar all
         collected sosreports """
-        if self.primary.connected:
+        filters = set([self.primary.address, self.primary.hostname])
+        # add primary if:
+        # - we are connected to it and
+        #   - its hostname is in node_list, or
+        #   - we dont forcibly remove local host from collection
+        #     (i.e. strict_node_list=False)
+        if self.primary.connected and \
+                (filters.intersection(set(self.node_list)) or
+                 not self.cluster.strict_node_list):
             self.client_list.append(self.primary)
 
         self.ui_log.info("\nConnecting to nodes...")
-        filters = [self.primary.address, self.primary.hostname]
         nodes = [(n, None) for n in self.node_list if n not in filters]
 
         if self.opts.password_per_node:
@@ -1190,7 +1246,7 @@ this utility or remote systems that it connects to.
             self.report_num = len(self.client_list)
 
             if self.report_num == 0:
-                self.exit("No nodes connected. Aborting...")
+                self.exit("No nodes connected. Aborting...", 1)
             elif self.report_num == 1:
                 if self.client_list[0].address == 'localhost':
                     self.exit(
@@ -1198,7 +1254,7 @@ this utility or remote systems that it connects to.
                         "failure to either enumerate or connect to cluster "
                         "nodes. Assuming single collection from localhost is "
                         "not desired.\n"
-                        "Aborting..."
+                        "Aborting...", 1
                     )
 
             self.ui_log.info("\nBeginning collection of sosreports from %s "
@@ -1214,13 +1270,10 @@ this utility or remote systems that it connects to.
             pool.map(self._collect, self.client_list, chunksize=1)
             pool.shutdown(wait=True)
         except KeyboardInterrupt:
-            self.log_error('Exiting on user cancel\n')
-            self.cluster.cleanup()
-            os._exit(130)
+            self.exit("Exiting on user cancel\n", 130, force=True)
         except Exception as err:
-            self.log_error('Could not connect to nodes: %s' % err)
-            self.cluster.cleanup()
-            os._exit(1)
+            msg = 'Could not connect to nodes: %s' % err
+            self.exit(msg, 1, force=True)
 
         if hasattr(self.cluster, 'run_extra_cmd'):
             self.ui_log.info('Collecting additional data from primary node...')
@@ -1236,7 +1289,8 @@ this utility or remote systems that it connects to.
             msg = 'No sosreports were collected, nothing to archive...'
             self.exit(msg, 1)
 
-        if self.opts.upload and self.policy.get_upload_url():
+        if (self.opts.upload and self.policy.get_upload_url()) or \
+                self.opts.upload_s3_endpoint:
             try:
                 self.policy.upload_archive(arc_name)
                 self.ui_log.info("Uploaded archive successfully")
@@ -1326,6 +1380,7 @@ this utility or remote systems that it connects to.
                 self.archive.add_final_manifest_data(
                     self.opts.compression_type
                 )
+            self._obfuscate_upload_passwords()
             if do_clean:
                 _dir = os.path.join(self.tmpdir, self.archive._name)
                 cleaner.obfuscate_file(

@@ -127,7 +127,7 @@ class ocp(Cluster):
         collection via a container image
         """
         if not self.set_transport_type() == 'oc':
-            return
+            return None
 
         out = self.exec_primary_cmd(self.fmt_oc_cmd("auth can-i '*' '*'"))
         self.oc_cluster_admin = out['status'] == 0
@@ -142,29 +142,62 @@ class ocp(Cluster):
             self.fmt_oc_cmd("new-project %s" % self.project)
         )
         if ret['status'] == 0:
+            self._label_sos_project()
             return True
 
         self.log_debug("Failed to create project: %s" % ret['output'])
         raise Exception("Failed to create temporary project for collection. "
                         "\nAborting...")
 
+    def _label_sos_project(self):
+        """Add pertinent labels to the temporary project we've created so that
+        our privileged containers can properly run.
+        """
+        labels = [
+            "security.openshift.io/scc.podSecurityLabelSync=false",
+            "pod-security.kubernetes.io/enforce=privileged"
+        ]
+        for label in labels:
+            ret = self.exec_primary_cmd(
+                self.fmt_oc_cmd(
+                    f"label namespace {self.project} {label} --overwrite"
+                )
+            )
+            if not ret['status'] == 0:
+                raise Exception(
+                    f"Error applying namespace labels: {ret['output']}"
+                )
+
     def cleanup(self):
         """Remove the project we created to execute within
         """
         if self.project:
-            ret = self.exec_primary_cmd(
-                self.fmt_oc_cmd("delete project %s" % self.project)
-            )
-            if not ret['status'] == 0:
-                self.log_error("Error deleting temporary project: %s"
-                               % ret['output'])
-            ret = self.exec_primary_cmd(
-                self.fmt_oc_cmd("wait namespace/%s --for=delete --timeout=30s"
-                                % self.project)
-            )
-            if not ret['status'] == 0:
-                self.log_error("Error waiting for temporary project to be "
-                               "deleted: %s" % ret['output'])
+            try:
+                ret = self.exec_primary_cmd(
+                    self.fmt_oc_cmd(f"delete project {self.project}"),
+                    timeout=30
+                )
+                if not ret['status'] == 0:
+                    self.log_error(
+                        f"Error deleting temporary project: {ret['output']}"
+                    )
+                ret = self.exec_primary_cmd(
+                    self.fmt_oc_cmd(
+                        f"wait namespace/{self.project} --for=delete "
+                        f"--timeout=30s"
+                    )
+                )
+                if not ret['status'] == 0:
+                    self.log_error(
+                        f"Error waiting for temporary project to be deleted: "
+                        f"{ret['output']}"
+                    )
+            except Exception as err:
+                self.log_error(
+                    f"Failed attempting to remove temporary project "
+                    f"'sos-collect-tmp': {err}\n"
+                    f"Please manually remove the temporary project."
+                )
             # don't leave the config on a non-existing project
             self.exec_primary_cmd(self.fmt_oc_cmd("project default"))
             self.project = None
@@ -231,8 +264,9 @@ class ocp(Cluster):
             for node_name, node in self.node_dict.items():
                 if roles:
                     for role in roles:
-                        if role == node['roles']:
+                        if role in node['roles']:
                             nodes.append(node_name)
+                            break
                 else:
                     nodes.append(node_name)
         else:

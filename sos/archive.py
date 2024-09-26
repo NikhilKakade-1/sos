@@ -16,6 +16,7 @@ import logging
 import codecs
 import errno
 import stat
+import re
 from datetime import datetime
 from threading import Lock
 
@@ -72,7 +73,7 @@ class Archive(object):
     # this is our contract to clients of the Archive class hierarchy.
     # All sub-classes need to implement these methods (or inherit concrete
     # implementations from a parent class.
-    def add_file(self, src, dest=None):
+    def add_file(self, src, dest=None, force=False):
         raise NotImplementedError
 
     def add_string(self, content, dest, mode='w'):
@@ -343,12 +344,12 @@ class FileCacheArchive(Archive):
             self.log_debug("caught '%s' setting attributes of '%s'"
                            % (e, dest))
 
-    def add_file(self, src, dest=None):
+    def add_file(self, src, dest=None, force=False):
         with self._path_lock:
             if not dest:
                 dest = src
 
-            dest = self.check_path(dest, P_FILE)
+            dest = self.check_path(dest, P_FILE, force=force)
             if not dest:
                 return
 
@@ -389,14 +390,14 @@ class FileCacheArchive(Archive):
             # on file content.
             dest = self.check_path(dest, P_FILE, force=True)
 
-            f = codecs.open(dest, mode, encoding='utf-8')
-            if isinstance(content, bytes):
-                content = content.decode('utf8', 'ignore')
-            f.write(content)
-            if os.path.exists(src):
-                self._copy_attributes(src, dest)
-            self.log_debug("added string at '%s' to FileCacheArchive '%s'"
-                           % (src, self._archive_root))
+            with codecs.open(dest, mode, encoding='utf-8') as f:
+                if isinstance(content, bytes):
+                    content = content.decode('utf8', 'ignore')
+                f.write(content)
+                if os.path.exists(src):
+                    self._copy_attributes(src, dest)
+                self.log_debug("added string at '%s' to FileCacheArchive '%s'"
+                               % (src, self._archive_root))
 
     def add_binary(self, content, dest):
         with self._path_lock:
@@ -404,8 +405,8 @@ class FileCacheArchive(Archive):
             if not dest:
                 return
 
-            f = codecs.open(dest, 'wb', encoding=None)
-            f.write(content)
+            with codecs.open(dest, 'wb', encoding=None) as f:
+                f.write(content)
             self.log_debug("added binary content at '%s' to archive '%s'"
                            % (dest, self._archive_root))
 
@@ -558,6 +559,43 @@ class FileCacheArchive(Archive):
         self._archive_root = _new_root
         self._archive_name = os.path.join(self._tmp_dir, self.name())
 
+    def do_file_sub(self, path, regexp, subst):
+        """Apply a regexp substitution to a file in the archive.
+
+        :param path: Path in the archive where the file can be found
+        :type path: ``str``
+
+        :param regexp:  A regex to match the contents of the file
+        :type regexp: ``str`` or compiled ``re`` object
+
+        :param subst: The substitution string to be used to replace matches
+                      within the file
+        :type subst: ``str``
+
+        :returns: Number of replacements made
+        :rtype: ``int``
+        """
+        common_flags = re.IGNORECASE | re.MULTILINE
+        if hasattr(regexp, "pattern"):
+            pattern = regexp.pattern
+            flags = regexp.flags | common_flags
+        else:
+            pattern = regexp
+            flags = common_flags
+
+        content = ""
+        with self.open_file(path) as readable:
+            content = readable.read()
+        if not isinstance(content, str):
+            content = content.decode('utf8', 'ignore')
+        result, replacements = re.subn(pattern, subst, content,
+                                       flags=flags)
+        if replacements:
+            self.add_string(result, path)
+        else:
+            replacements = 0
+        return replacements
+
     def finalize(self, method):
         self.log_info("finalizing archive '%s' using method '%s'"
                       % (self._archive_root, method))
@@ -658,13 +696,16 @@ class TarFileArchive(FileCacheArchive):
         orig_path = tarinfo.name[len(os.path.split(self._archive_root)[-1]):]
         if not orig_path:
             orig_path = self._archive_root
+        skips = ['/version.txt$', '/sos_logs(/.*)?', '/sos_reports(/.*)?']
+        if any(re.match(skip, orig_path) for skip in skips):
+            return None
         try:
             fstat = os.stat(orig_path)
         except OSError:
             return tarinfo
         if self._with_selinux_context:
             context = self.get_selinux_context(orig_path)
-            if(context):
+            if context:
                 tarinfo.pax_headers['RHT.security.selinux'] = context
         self.set_tarinfo_from_stat(tarinfo, fstat)
         return tarinfo
@@ -697,6 +738,15 @@ class TarFileArchive(FileCacheArchive):
             kwargs = {'preset': 3}
         tar = tarfile.open(self._archive_name, mode="w:%s" % _comp_mode,
                            **kwargs)
+        # add commonly reviewed files first, so that they can be more easily
+        # read from memory without needing to extract the whole archive
+        for _content in ['version.txt', 'sos_reports', 'sos_logs']:
+            if not os.path.exists(os.path.join(self._archive_root, _content)):
+                continue
+            tar.add(
+                os.path.join(self._archive_root, _content),
+                arcname=f"{self._name}/{_content}"
+            )
         # we need to pass the absolute path to the archive root but we
         # want the names used in the archive to be relative.
         tar.add(self._archive_root, arcname=self._name,

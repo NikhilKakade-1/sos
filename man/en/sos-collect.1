@@ -41,7 +41,6 @@ sos collect \- Collect sosreports from multiple (cluster) nodes
     [\-\-skip-files FILES]
     [\-s|\-\-sysroot SYSROOT]
     [\-\-ssh\-user SSH_USER]
-    [\-\-sos-cmd SOS_CMD]
     [\-t|\-\-threads THREADS]
     [\-\-timeout TIMEOUT]
     [\-\-transport TRANSPORT]
@@ -177,7 +176,7 @@ to none.
 \fB\-\-save\-group\fR GROUP
 Save the results of this run of sos collect to a host group definition.
 
-sos-colllector will write a JSON-formatted file with name GROUP to /var/lib/sos collect/
+sos-collector will write a JSON-formatted file with name GROUP to /var/lib/sos collect/
 with the settings for cluster-type, primary, and the node list as discovered by cluster enumeration.
 Note that this means regexes are not directly saved to host groups, but the results of matching against
 those regexes are.
@@ -259,7 +258,7 @@ the type of cluster in use.
 .TP
 \fB\-\-image IMAGE\fR
 Specify an image to use for the temporary container created for collections on
-containerized host, if you do not want to use the default image specifed by the
+containerized host, if you do not want to use the default image specified by the
 host's policy. Note that this should include the registry.
 .TP
 \fB\-\-force-pull-image TOGGLE, \-\-pull TOGGLE\fR
@@ -339,15 +338,6 @@ sos collect will prompt for a sudo password for non-root users.
 \fB\-s\fR SYSROOT, \fB\-\-sysroot\fR SYSROOT
 Sosreport option. Specify an alternate root file system path.
 .TP
-\fB\-\-sos-cmd\fR SOS_CMD
-Define all options that sosreport should be run with on the nodes. This will
-override any other commandline options as well as any options specified by a 
-cluster profile.
-
-The sosreport command will execute as 'sosreport --batch SOS_CMD'. The BATCH 
-option cannot be removed from the sosreport command as it is required to run 
-sosreport non-interactively for sos collect to function.
-.TP
 \fB\-t\fR THREADS \fB\-\-threads\fR THREADS
 Report option. Specify the number of collection threads to run.
 
@@ -388,7 +378,7 @@ This is NOT the same as specifying a temporary directory for sosreport on the re
 \fB\-v\fR \fB\-\-verbose\fR
 Print debug information to screen.
 .TP
-\fB\-\-verfiy\fR
+\fB\-\-verify\fR
 Sosreport option. Passes the "--verify" option to sosreport on the nodes which 
 causes sosreport to validate plugin-specific data during collection.
 
@@ -405,4 +395,8 @@ Sosreport option. Override the default compression type.
 .BR sos.conf (5)
 
 .SH MAINTAINER
-    Jake Hunsaker <jhunsake@redhat.com>
+.nf
+Maintained on GitHub at https://github.com/sosreport/sos
+.fi
+.SH AUTHORS & CONTRIBUTORS
+See \fBAUTHORS\fR file in the package documentation.

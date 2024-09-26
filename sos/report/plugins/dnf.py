@@ -46,7 +46,7 @@ class DNFPlugin(Plugin, RedHatPlugin):
             if "[i]" in line:
                 module = line.split()[0]
                 if module != "Hint:":
-                    self.add_cmd_output("dnf --assumeno module info " + module,
+                    self.add_cmd_output("dnf module info " + module,
                                         tags='dnf_module_info')
 
     def setup(self):
@@ -55,7 +55,12 @@ class DNFPlugin(Plugin, RedHatPlugin):
             '/etc/dnf/modules.d/.*.module': 'dnf_modules'
         })
 
-        self.add_copy_spec("/etc/dnf/")
+        self.add_copy_spec([
+            "/etc/dnf/",
+            "/etc/yum.conf",
+            "/etc/yum/pluginconf.d/",
+            "/etc/yum/vars/",
+        ])
         self.add_copy_spec("/etc/yum.repos.d/",
                            tags=['yum_repos_d', 'dnf_repos_d', 'dnf_repo'])
 
@@ -66,13 +71,12 @@ class DNFPlugin(Plugin, RedHatPlugin):
             self.add_copy_spec("/var/log/dnf.librepo.log*")
             self.add_copy_spec("/var/log/dnf.rpm.log*")
 
-        self.add_cmd_output("dnf --assumeno module list",
+        self.add_cmd_output("dnf module list",
                             tags='dnf_module_list')
 
         self.add_cmd_output([
             "dnf --version",
-            "dnf --assumeno list installed *dnf*",
-            "dnf --assumeno list extras",
+            "dnf list extras",
             "package-cleanup --dupes",
             "package-cleanup --problems"
         ])
@@ -115,13 +119,33 @@ class DNFPlugin(Plugin, RedHatPlugin):
                                     tags='dnf_history_info')
 
         # Get list of dnf installed modules and their details.
-        module_cmd = "dnf --assumeno module list --installed"
+        module_cmd = "dnf module list --installed"
         modules = self.collect_cmd_output(module_cmd)
         self.get_modules_info(modules['output'])
 
     def postproc(self):
-        regexp = r"(proxy_password(\s)*=(\s)*)(\S+)\n"
+        # Scrub passwords in repositories and yum/dnf variables
+        # Example of scrubbing:
+        #
+        #   password=hackme
+        # To:
+        #   password=********
+        #
+        # Whitespace around '=' is allowed.
+        regexp = r"(password(\s)*=(\s)*)(\S+)\n"
         repl = r"\1********\n"
-        self.do_path_regex_sub("/etc/yum.repos.d/*", regexp, repl)
+        for f in ["/etc/yum.repos.d/*", "/etc/dnf/vars/*"]:
+            self.do_path_regex_sub(f, regexp, repl)
+
+        # Scrub password and proxy_password from /etc/dnf/dnf.conf.
+        # This uses the same regex patterns as above.
+        #
+        # Example of scrubbing:
+        #
+        #   proxy_password = hackme
+        # To:
+        #   proxy_password = ********
+        #
+        self.do_file_sub("/etc/dnf/dnf.conf", regexp, repl)
 
 # vim: set et ts=4 sw=4 :

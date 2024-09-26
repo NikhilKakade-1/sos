@@ -27,11 +27,13 @@ sos report \- Collect and package diagnostic and support data
           [--list-profiles]\fR
           [--verify]\fR
           [--log-size]\fR
+          [--journal-size]\fR
           [--all-logs]\fR
           [--since YYYYMMDD[HHMMSS]]\fR
           [--skip-commands commands]\fR
           [--skip-files files]\fR
           [--allow-system-changes]\fR
+          [--low-priority]\fR
           [-z|--compression-type method]\fR
           [--encrypt]\fR
           [--encrypt-key KEY]\fR
@@ -185,13 +187,22 @@ Places a limit on the size of collected logs and output in MiB. Note that this
 causes sos to capture the last X amount of the file or command output collected.
 
 By default, this is set to 25 MiB and applies to all files and command output collected
-with the exception of journal collections, which are limited to 100 MiB.
+with the exception of journal collections, which are limited by the \fB--journal-size\fR
+option instead.
 
 Setting this value to 0 removes all size limitations, and any files or commands
 collected will be collected in their entirety, which may drastically increase the
 size of the final sos report tarball and the memory usage of sos during collection
-of commands, such as very large journals that may be several GiB in size.
+of commands.
 
+.TP
+.B \--journal-size
+Places a limit on the size of journals collected in MiB. Note that this causes sos
+to capture the last X amount of the journal.
+
+By default, this is set to 100 MiB. Setting this value to 0 removes all size limitations,
+as does the use of the \fB--all-logs\fR option. This may drastically increase the size
+of the final sos report tarball.
 .TP
 .B \--all-logs
 Tell plugins to collect all possible log data ignoring any size limits
@@ -220,6 +231,11 @@ for example \fB/etc/sos/*\fR.
 .B \--allow-system-changes
 Run commands even if they can change the system (e.g. load kernel modules).
 .TP
+.B \--low-priority
+Set sos to execute as a low priority process so that is does not interfere with
+other processes running on the system. Specific distributions may set their own
+constraints, but by default this involves setting process niceness to 19 and, if
+available, setting an idle IO class via ionice.
 .B \-z, \--compression-type METHOD
 Override the default compression type specified by the active policy.
 .TP
@@ -423,7 +439,7 @@ If this option is omitted and upload is requested, you will be prompted for one.
 If --batch is used, this prompt will not occur, so any uploads are likely to fail unless
 this option is used.
 
-Note that this will result in the plaintext string appearing in `ps` output that may
+Note that this may result in the plaintext string appearing in `ps` output that may
 be collected by sos and be in the archive. If a password must be provided by you
 for uploading, it is strongly recommended to not use --batch and enter the password
 when prompted rather than using this option.
@@ -478,13 +494,7 @@ Display usage message.
 
 .SH MAINTAINER
 .nf
-Jake Hunsaker <jhunsake@redhat.com>
+Maintained on GitHub at https://github.com/sosreport/sos
 .fi
 .SH AUTHORS & CONTRIBUTORS
 See \fBAUTHORS\fR file in the package documentation.
-.nf
-.SH TRANSLATIONS
-.nf
-Translations are handled by transifex (https://fedorahosted.org/transifex/)
-.fi
-.fi

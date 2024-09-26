@@ -22,7 +22,11 @@ class NetworkManager(Plugin, RedHatPlugin, UbuntuPlugin):
         self.add_copy_spec([
             "/etc/NetworkManager/NetworkManager.conf",
             "/etc/NetworkManager/system-connections",
-            "/etc/NetworkManager/dispatcher.d"
+            "/etc/NetworkManager/dispatcher.d",
+            "/etc/NetworkManager/conf.d",
+            "/usr/lib/NetworkManager/conf.d",
+            "/run/NetworkManager/conf.d",
+            "/var/lib/NetworkManager/NetworkManager-intern.conf"
         ])
 
         self.add_journal(units="NetworkManager")
@@ -53,6 +57,7 @@ class NetworkManager(Plugin, RedHatPlugin, UbuntuPlugin):
             self.add_cmd_output([
                 "nmcli general status",
                 "nmcli con",
+                "nmcli -f all con",
                 "nmcli con show --active",
                 "nmcli dev"])
             nmcli_con_details_cmd = nmcli_con_details_template % "show"
@@ -94,16 +99,15 @@ class NetworkManager(Plugin, RedHatPlugin, UbuntuPlugin):
                     self.add_cmd_output('%s "%s"' %
                                         (nmcli_con_details_cmd, con))
 
-            nmcli_dev_status_result = self.exec_cmd(
-                "nmcli --terse --fields DEVICE dev"
+            self.add_device_cmd(
+                nmcli_dev_details_cmd + ' "%(dev)s"',
+                devices='ethernet'
             )
-            if nmcli_dev_status_result['status'] == 0:
-                for dev in nmcli_dev_status_result['output'].splitlines():
-                    if dev[0:7] == 'Warning':
-                        continue
-                    # See above comment describing quoting conventions.
-                    self.add_cmd_output('%s "%s"' %
-                                        (nmcli_dev_details_cmd, dev))
+
+        self.add_cmd_tags({
+            "nmcli dev show": "nmcli_dev_show",
+            "nmcli dev show .*": "nmcli_dev_show_sos"
+        })
 
     def postproc(self):
         for root, dirs, files in os.walk(

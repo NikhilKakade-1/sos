@@ -30,7 +30,9 @@ class Candlepin(Plugin, RedHatPlugin):
         self.dbpasswd = ""
         cfg_file = "/etc/candlepin/candlepin.conf"
         try:
-            for line in open(cfg_file).read().splitlines():
+            with open(cfg_file, 'r') as cfile:
+                candle_lines = cfile.read().splitlines()
+            for line in candle_lines:
                 # skip empty lines and lines with comments
                 if not line or line[0] == '#':
                     continue
@@ -128,7 +130,7 @@ class Candlepin(Plugin, RedHatPlugin):
         self.do_file_sub("/var/log/candlepin/cpdb.log", cpdbreg, repl)
         for key in ["trustStorePassword", "keyStorePassword"]:
             self.do_file_sub("/etc/candlepin/broker.xml",
-                             r"%s=(\w*)([;<])" % key,
-                             r"%s=********\2" % key)
+                             r"(%s)=(\w*)([;<])" % key,
+                             r"\1=********\3")
 
 # vim: set et ts=4 sw=4 :

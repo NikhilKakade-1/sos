@@ -110,6 +110,10 @@ class OpenStackIronic(Plugin):
             for path in ['/var/lib/ironic', '/httpboot', '/tftpboot']:
                 self.add_cmd_output('ls -laRt %s' % path)
 
+        self.add_file_tags({
+            ".*/etc/ironic/ironic.conf": "ironic_conf"
+        })
+
         vars_all = [p in os.environ for p in [
                     'OS_USERNAME', 'OS_PASSWORD']]
 
@@ -141,11 +145,11 @@ class OpenStackIronic(Plugin):
         connection_keys = ["connection", "sql_connection"]
 
         self.apply_regex_sub(
-            r"((?m)^\s*(%s)\s*=\s*)(.*)" % "|".join(protect_keys),
+            r"(^\s*(%s)\s*=\s*)(.*)" % "|".join(protect_keys),
             r"\1*********"
         )
         self.apply_regex_sub(
-            r"((?m)^\s*(%s)\s*=\s*(.*)://(\w*):)(.*)(@(.*))" %
+            r"(^\s*(%s)\s*=\s*(.*)://(\w*):)(.*)(@(.*))" %
             "|".join(connection_keys),
             r"\1*********\6"
         )

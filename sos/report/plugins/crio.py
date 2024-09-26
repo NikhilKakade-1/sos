@@ -9,10 +9,10 @@
 # See the LICENSE file in the source distribution for further information.
 
 from sos.report.plugins import (Plugin, RedHatPlugin, UbuntuPlugin,
-                                SoSPredicate, PluginOpt)
+                                SoSPredicate, PluginOpt, CosPlugin)
 
 
-class CRIO(Plugin, RedHatPlugin, UbuntuPlugin):
+class CRIO(Plugin, RedHatPlugin, UbuntuPlugin, CosPlugin):
 
     short_desc = 'CRI-O containers'
     plugin_name = 'crio'
@@ -85,7 +85,8 @@ class CRIO(Plugin, RedHatPlugin, UbuntuPlugin):
                                 subdir="containers")
             if self.get_option('logs'):
                 self.add_cmd_output("crictl logs -t %s" % container,
-                                    subdir="containers/logs", priority=100)
+                                    subdir="containers/logs", priority=100,
+                                    tags="crictl_logs")
 
         for image in images:
             self.add_cmd_output("crictl inspecti %s" % image, subdir="images")

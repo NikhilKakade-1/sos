@@ -41,7 +41,7 @@ class SoSHostnameMap(SoSMap):
     ]
 
     strip_exts = ('.yaml', '.yml', '.crt', '.key', '.pem', '.log', '.repo',
-                  '.rules')
+                  '.rules', '.conf', '.cfg')
 
     host_count = 0
     domain_count = 0
@@ -79,10 +79,6 @@ class SoSHostnameMap(SoSMap):
                         )
                         self._domains[_domain_to_inject] = _ob_domain
         self.set_initial_counts()
-
-    def load_domains_from_options(self, domains):
-        for domain in domains:
-            self.sanitize_domain(domain.split('.'))
 
     def get_regex_result(self, item):
         """Override the base get_regex_result() to provide a regex that, if
@@ -147,7 +143,9 @@ class SoSHostnameMap(SoSMap):
         if item in self.dataset:
             return self.dataset[item]
         if not self.domain_name_in_loaded_domains(item.lower()):
-            return item
+            # no match => return the original string with optional
+            # leading/trailing '.' or '_' characters
+            return ''.join([prefix, item, suffix])
         if item.endswith(self.strip_exts):
             ext = '.' + item.split('.')[-1]
             item = item.replace(ext, '')
@@ -217,6 +215,7 @@ class SoSHostnameMap(SoSMap):
             if all([h.isupper() for h in host]):
                 _fqdn = _fqdn.upper()
             return _fqdn
+        return None
 
     def sanitize_short_name(self, hostname):
         """Obfuscate the short name of the host with an incremented counter

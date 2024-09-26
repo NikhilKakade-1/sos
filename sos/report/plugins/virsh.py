@@ -29,21 +29,29 @@ class LibvirtClient(Plugin, IndependentPlugin):
 
         # get host information
         subcmds = [
-            'list --all',
             'domcapabilities',
             'capabilities',
             'nodeinfo',
-            'freecell',
+            'freecell --all',
             'node-memory-tune',
-            'version'
+            'version',
+            'pool-capabilities',
+            'nodecpumap',
+            'maxvcpus kvm',
+            'sysinfo',
+            'nodedev-list --tree',
         ]
 
         for subcmd in subcmds:
             self.add_cmd_output('%s %s' % (cmd, subcmd), foreground=True)
 
+        self.add_cmd_output("%s list --all" % cmd,
+                            tags="virsh_list_all", foreground=True)
+
         # get network, pool and nwfilter elements
         for k in ['net', 'nwfilter', 'pool']:
-            k_list = self.collect_cmd_output('%s %s-list' % (cmd, k),
+            k_list = self.collect_cmd_output('%s %s-list %s' % (cmd, k, '--all'
+                                             if k in ['net', 'pool'] else ''),
                                              foreground=True)
             if k_list['status'] == 0:
                 k_lines = k_list['output'].splitlines()
@@ -69,4 +77,26 @@ class LibvirtClient(Plugin, IndependentPlugin):
                     self.add_cmd_output('%s %s %s' % (cmd, x, d),
                                         foreground=True)
 
+        nodedev_output = self.exec_cmd(
+            '{0} nodedev-list'.format(cmd), foreground=True)
+        if nodedev_output['status'] == 0:
+            for n in nodedev_output['output'].splitlines():
+                self.add_cmd_output(
+                    '{0} nodedev-dumpxml {1}'.format(cmd, n), foreground=True)
+
+    def postproc(self):
+        match_exp = r"(\s*passwd\s*=\s*\")([^\"]*)(\".*)"
+        virsh_path_exps = [
+            r"/root/\.cache/virt-manager/.*\.log",
+            r"/root/\.virt-manager/.*\.log"
+        ]
+        for path_exp in virsh_path_exps:
+            # Scrub passwords in virt-manager logs
+            # Example of scrubbing:
+            #
+            #   passwd="hackme"
+            # To:
+            #   passwd="******"
+            #
+            self.do_path_regex_sub(path_exp, match_exp, r"\1******\3")
 # vim: et ts=4 sw=4

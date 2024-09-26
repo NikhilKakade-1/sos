@@ -28,9 +28,10 @@ class Rhui(Plugin, RedHatPlugin):
             "/var/cache/rhui/*",
             "/root/.rhui/*",
             "/var/log/rhui/*",
+            "/var/log/rhui-installer/*",
         ])
         # skip collecting certificate keys
-        self.add_forbidden_path("/etc/pki/rhui/**/*.key", recursive=True)
+        self.add_forbidden_path("/etc/pki/rhui/**/*.key")
 
         # call rhui-manager commands with 1m timeout and
         # with an env. variable ensuring that "RHUI Username:"
@@ -45,9 +46,13 @@ class Rhui(Plugin, RedHatPlugin):
         # hide rhui_manager_password value in (also rotated) answers file
         self.do_path_regex_sub(
                 r"/root/\.rhui/answers.yaml.*",
-                r"(\s*rhui_manager_password\s*:)\s*(\S+)",
+                r"(\s*(rhui_manager|registry)_password\s*:)\s*(\S+)",
                 r"\1********")
-        # obfuscate twoo cookies for login session
+        # hide registry_password value in rhui-tools.conf
+        self.do_path_regex_sub("/etc/rhui/rhui-tools.conf",
+                               r"(registry_password:)\s*(.+)",
+                               r"\1 ********")
+        # obfuscate two cookies for login session
         for cookie in ["csrftoken", "sessionid"]:
             self.do_path_regex_sub(
                 r"/root/\.rhui/.*/cookies.txt",

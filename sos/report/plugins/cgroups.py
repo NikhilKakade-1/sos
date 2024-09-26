@@ -21,7 +21,7 @@ class Cgroups(Plugin, DebianPlugin, UbuntuPlugin, CosPlugin):
     def setup(self):
 
         self.add_file_tags({
-            '/proc/1/cgroups': 'insights_init_process_cgroup'
+            '/proc/1/cgroups': 'init_process_cgroup'
         })
 
         self.add_copy_spec([
@@ -31,10 +31,8 @@ class Cgroups(Plugin, DebianPlugin, UbuntuPlugin, CosPlugin):
 
         self.add_cmd_output("systemd-cgls")
         self.add_forbidden_path(
-            "/sys/fs/cgroup/memory/**/memory.kmem.slabinfo",
-            recursive=True)
-
-        return
+            "/sys/fs/cgroup/memory/**/memory.kmem.slabinfo"
+        )
 
 
 class RedHatCgroups(Cgroups, RedHatPlugin):

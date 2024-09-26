@@ -19,12 +19,58 @@ import tempfile
 import threading
 import time
 import io
-import magic
-
 from contextlib import closing
 from collections import deque
 
+try:
+    from packaging.version import parse as parse_version
+except ImportError:
+    from pkg_resources import parse_version
+
+# try loading magic>=0.4.20 which implements detect_from_filename method
+magic_mod = False
+try:
+    import magic
+    magic.detect_from_filename(__file__)
+    magic_mod = True
+except (ImportError, AttributeError):
+    log = logging.getLogger('sos')
+    from textwrap import fill
+    msg = ("""\
+WARNING: Failed to load 'magic' module version >= 0.4.20 which sos aims to \
+use for detecting binary files. A less effective method will be used. It is \
+recommended to install proper python3-magic package with the module.
+""")
+    log.warning('\n' + fill(msg, 72, replace_whitespace=False) + '\n')
+
+
 TIMEOUT_DEFAULT = 300
+
+__all__ = [
+    'TIMEOUT_DEFAULT',
+    'ImporterHelper',
+    'SoSTimeoutError',
+    'TempFileUtil',
+    'bold',
+    'file_is_binary',
+    'fileobj',
+    'find',
+    'get_human_readable',
+    'grep',
+    'import_module',
+    'is_executable',
+    'listdir',
+    'parse_version',
+    'path_exists',
+    'path_isdir',
+    'path_isfile',
+    'path_islink',
+    'path_join',
+    'recursive_dict_values_by_key',
+    'shell_out',
+    'sos_get_command_output',
+    'tail',
+]
 
 
 def tail(filename, number_of_bytes):
@@ -75,17 +121,26 @@ def file_is_binary(fname):
     :returns:   True if binary, else False
     :rtype:     ``bool``
     """
-    try:
-        _ftup = magic.detect_from_filename(fname)
-        _mimes = ['text/', 'inode/']
-        return (
-            _ftup.encoding == 'binary' and not
-            any(_ftup.mime_type.startswith(_mt) for _mt in _mimes)
-        )
-    except Exception:
-        # if for some reason this check fails, don't blindly remove all files
-        # but instead rely on other checks done by the component
-        return False
+    if magic_mod:
+        try:
+            _ftup = magic.detect_from_filename(fname)
+            _mimes = ['text/', 'inode/']
+            return (
+                _ftup.encoding == 'binary' and not
+                any(_ftup.mime_type.startswith(_mt) for _mt in _mimes)
+            )
+        except Exception:
+            pass
+    # if for some reason the above check fails or magic>=0.4.20 is not present,
+    # fail over to checking the very first byte of the file content
+    with open(fname, 'tr') as tfile:
+        try:
+            # when opened as above (tr), reading binary content will raise
+            # an exception
+            tfile.read(1)
+            return False
+        except UnicodeDecodeError:
+            return True
 
 
 def find(file_pattern, top_dir, max_depth=None, path_pattern=None):
@@ -152,14 +207,14 @@ def sos_get_command_output(command, timeout=TIMEOUT_DEFAULT, stderr=False,
             os.chdir(chdir)
 
     def _check_poller(proc):
-        if poller():
+        if poller() or proc.poll() == 124:
             proc.terminate()
             raise SoSTimeoutError
         time.sleep(0.01)
 
     cmd_env = os.environ.copy()
     # ensure consistent locale for collected command output
-    cmd_env['LC_ALL'] = 'C'
+    cmd_env['LC_ALL'] = 'C.UTF-8'
     # optionally add an environment change for the command
     if env:
         for key, value in env.items():
@@ -216,6 +271,7 @@ def sos_get_command_output(command, timeout=TIMEOUT_DEFAULT, stderr=False,
                     _output.close()
                 # until we separate timeouts from the `timeout` command
                 # handle per-cmd timeouts via Plugin status checks
+                reader.running = False
                 return {'status': 124, 'output': reader.get_contents(),
                         'truncated': reader.is_full}
         if to_file:
@@ -229,6 +285,8 @@ def sos_get_command_output(command, timeout=TIMEOUT_DEFAULT, stderr=False,
         truncated = reader.is_full
 
     except OSError as e:
+        if to_file:
+            _output.close()
         if e.errno == errno.ENOENT:
             return {'status': 127, 'output': "", 'truncated': ''}
         else:
@@ -250,7 +308,12 @@ def import_module(module_fqname, superclasses=None):
     be subclasses of the specified superclass or superclasses. If superclasses
     is plural it must be a tuple of classes."""
     module_name = module_fqname.rpartition(".")[-1]
-    module = __import__(module_fqname, globals(), locals(), [module_name])
+    try:
+        module = __import__(module_fqname, globals(), locals(), [module_name])
+    except ImportError as e:
+        print(f'Error while trying to load module {module_fqname}: '
+              f' {e.__class__.__name__}')
+        raise e
     modules = [class_ for cname, class_ in
                inspect.getmembers(module, inspect.isclass)
                if class_.__module__ == module_fqname]
@@ -287,6 +350,8 @@ def _os_wrapper(path, sysroot, method, module=os.path):
 
 
 def path_exists(path, sysroot):
+    if '*' in path:
+        return _os_wrapper(path, sysroot, 'glob', module=glob)
     return _os_wrapper(path, sysroot, 'exists')
 
 
@@ -323,6 +388,60 @@ def bold(text):
     :rtype:         ``str``
     """
     return '\033[1m' + text + '\033[0m'
+
+
+def recursive_dict_values_by_key(dobj, keys=[]):
+    """Recursively compile all elements of a potentially nested dict by a set
+    of keys. If a given key is a dict within ``dobj``, then _all_ elements
+    within that dict, regardless of child keys, will be returned.
+
+    For example, if a Plugin searches the devices dict for the 'storage' key,
+    then all storage devices under the that dict (e.g. block, fibre, etc...)
+    will be returned. However, if the Plugin specifies 'block' via ``keys``,
+    then only the block devices within the devices['storage'] dict will be
+    returned.
+
+    Any elements passed here that are _not_ keys within the dict or any nested
+    dicts will also be returned.
+
+    :param dobj:    The 'top-level' dict to intially search by
+    :type dobj:     ``dict``
+
+    :param keys:    Which keys to compile elements from within ``dobj``. If no
+                    keys are given, all nested elements are returned
+    :param keys:    ``list`` of ``str``
+
+    :returns:       All elements within the dict and any nested dicts
+    :rtype:         ``list``
+    """
+    _items = []
+    _filt = []
+    _items.extend(keys)
+    if isinstance(dobj, dict):
+        for k, v in dobj.items():
+            _filt.append(k)
+            # get everything below this key, including nested dicts
+            if not keys or k in keys:
+                _items.extend(recursive_dict_values_by_key(v))
+            # recurse into this dict only for dict keys that match what
+            # we're looking for
+            elif isinstance(v, dict):
+                try:
+                    # this will return a nested list, extract it
+                    _items.extend(
+                        recursive_dict_values_by_key(
+                            v[key] for key in keys if key in v
+                        )[0]
+                    )
+                except IndexError:
+                    # none of the keys given exist in the nested dict
+                    pass
+                _filt.extend(v.keys())
+
+    else:
+        _items.extend(dobj)
+
+    return [d for d in _items if d not in _filt]
 
 
 class FakeReader():
@@ -439,8 +558,7 @@ class ImporterHelper(object):
             pnames = self._get_plugins_from_list(py_files)
             if pnames:
                 return pnames
-            else:
-                return []
+        return []
 
     def get_modules(self):
         """Returns the list of importable modules in the configured python

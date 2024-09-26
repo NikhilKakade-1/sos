@@ -20,8 +20,10 @@ from sos.policies.init_systems.systemd import SystemdInit
 from sos.policies.runtimes.crio import CrioContainerRuntime
 from sos.policies.runtimes.podman import PodmanContainerRuntime
 from sos.policies.runtimes.docker import DockerContainerRuntime
+from sos.policies.runtimes.lxd import LxdContainerRuntime
 
-from sos.utilities import shell_out, is_executable, bold
+from sos.utilities import (shell_out, is_executable, bold,
+                           sos_get_command_output)
 
 
 try:
@@ -29,6 +31,12 @@ try:
     REQUESTS_LOADED = True
 except ImportError:
     REQUESTS_LOADED = False
+
+try:
+    import boto3
+    BOTO3_LOADED = True
+except ImportError:
+    BOTO3_LOADED = False
 
 # Container environment variables for detecting if we're in a container
 ENV_CONTAINER = 'container'
@@ -54,11 +62,23 @@ class LinuxPolicy(Policy):
     _upload_user = None
     _upload_password = None
     _upload_method = None
+    _upload_s3_endpoint = 'https://s3.amazonaws.com'
+    _upload_s3_bucket = None
+    _upload_s3_access_key = None
+    _upload_s3_secret_key = None
+    _upload_s3_region = None
+    _upload_s3_object_prefix = ''
     default_container_runtime = 'docker'
     _preferred_hash_name = None
     upload_url = None
     upload_user = None
     upload_password = None
+    upload_s3_endpoint = None
+    upload_s3_bucket = None
+    upload_s3_access_key = None
+    upload_s3_secret_key = None
+    upload_s3_region = None
+    upload_s3_object_prefix = None
     # collector-focused class attrs
     containerized = False
     container_image = None
@@ -94,7 +114,8 @@ class LinuxPolicy(Policy):
             _crun = [
                 PodmanContainerRuntime(policy=self),
                 DockerContainerRuntime(policy=self),
-                CrioContainerRuntime(policy=self)
+                CrioContainerRuntime(policy=self),
+                LxdContainerRuntime(policy=self),
             ]
             for runtime in _crun:
                 if runtime.check_is_active():
@@ -115,15 +136,6 @@ class LinuxPolicy(Policy):
             '/etc/passwd',
             '/etc/shadow'
         ]
-
-    def default_runlevel(self):
-        try:
-            with open("/etc/inittab") as fp:
-                pattern = r"id:(\d{1}):initdefault:"
-                text = fp.read()
-                return int(re.findall(pattern, text)[0])
-        except (IndexError, IOError):
-            return 3
 
     def kernel_version(self):
         return self.release
@@ -286,6 +298,9 @@ class LinuxPolicy(Policy):
         cmdline_opts = self.commons['cmdlineopts']
         caseid = cmdline_opts.case_id if cmdline_opts.case_id else ""
 
+        if cmdline_opts.low_priority:
+            self._configure_low_priority()
+
         # Set the cmdline settings to the class attrs that are referenced later
         # The policy default '_' prefixed versions of these are untouched to
         # allow fallback
@@ -295,6 +310,14 @@ class LinuxPolicy(Policy):
         self.upload_password = cmdline_opts.upload_pass
         self.upload_archive_name = ''
 
+        self.upload_s3_endpoint = cmdline_opts.upload_s3_endpoint
+        self.upload_s3_region = cmdline_opts.upload_s3_region
+        self.upload_s3_access_key = cmdline_opts.upload_s3_access_key
+        self.upload_s3_bucket = cmdline_opts.upload_s3_bucket
+        self.upload_s3_object_prefix = cmdline_opts.upload_s3_object_prefix
+        self.upload_s3_secret_key = cmdline_opts.upload_s3_secret_key
+
+        # set or query for case id
         if not cmdline_opts.batch and not \
                 cmdline_opts.quiet:
             try:
@@ -305,19 +328,114 @@ class LinuxPolicy(Policy):
                         _("Optionally, please enter the case id that you are "
                           "generating this report for [%s]: ") % caseid
                     )
-                # Policies will need to handle the prompts for user information
-                if cmdline_opts.upload and self.get_upload_url():
-                    self.prompt_for_upload_user()
-                    self.prompt_for_upload_password()
-                self._print()
             except KeyboardInterrupt:
-                self._print()
                 raise
-
         if cmdline_opts.case_id:
             self.case_id = cmdline_opts.case_id
 
+        # set or query for upload credentials; this needs to be done after
+        # setting case id, as below methods might rely on detection of it
+        if not cmdline_opts.batch and not \
+                cmdline_opts.quiet:
+            try:
+                # Policies will need to handle the prompts for user information
+                if cmdline_opts.upload and self.get_upload_url() and \
+                        not cmdline_opts.upload_protocol == 's3':
+                    self.prompt_for_upload_user()
+                    self.prompt_for_upload_password()
+                elif cmdline_opts.upload_protocol == 's3':
+                    self.prompt_for_upload_s3_bucket()
+                    self.prompt_for_upload_s3_endpoint()
+                    self.prompt_for_upload_s3_access_key()
+                    self.prompt_for_upload_s3_secret_key()
+                self.ui_log.info('')
+            except KeyboardInterrupt:
+                raise
+
         return
+
+    def _configure_low_priority(self):
+        """Used to constrain sos to a 'low priority' execution, potentially
+        letting individual policies set their own definition of what that is.
+
+        By default, this will attempt to assign sos to an idle io class via
+        ionice if available. We will also renice our own pid to 19 in order to
+        not cause competition with other host processes for CPU time.
+        """
+        _pid = os.getpid()
+        if is_executable('ionice'):
+            ret = sos_get_command_output(
+                f"ionice -c3 -p {_pid}", timeout=5
+            )
+            if ret['status'] == 0:
+                self.soslog.info('Set IO class to idle')
+            else:
+                msg = (f"Error setting IO class to idle: {ret['output']} "
+                       f"(exit code {ret['status']})")
+                self.soslog.error(msg)
+        else:
+            self.ui_log.warning(
+                "Warning: unable to constrain report to idle IO class: "
+                "ionice is not available."
+            )
+
+        try:
+            os.nice(20)
+            self.soslog.info('Set niceness of report to 19')
+        except Exception as err:
+            self.soslog.error(f"Error setting report niceness to 19: {err}")
+
+    def prompt_for_upload_s3_access_key(self):
+        """Should be overridden by policies to determine if an access key needs
+        to be provided for upload or not
+        """
+        if not self.get_upload_s3_access_key():
+
+            msg = (
+                "Please provide the upload access key for bucket"
+                f" {self.get_upload_s3_bucket()} via endpoint"
+                f" {self.get_upload_s3_endpoint()}: "
+            )
+            self.upload_s3_access_key = input(_(msg))
+
+    def prompt_for_upload_s3_secret_key(self):
+        """Should be overridden by policies to determine if a secret key needs
+        to be provided for upload or not
+        """
+        if not self.get_upload_s3_secret_key():
+            msg = (
+                "Please provide the upload secret key for bucket"
+                f" {self.get_upload_s3_bucket()} via endpoint"
+                f" {self.get_upload_s3_endpoint()}: "
+            )
+            self.upload_s3_secret_key = getpass(msg)
+
+    def prompt_for_upload_s3_bucket(self):
+        """Should be overridden by policies to determine if a bucket needs to
+        be provided for upload or not
+        """
+        if not self.upload_s3_bucket:
+            if self.upload_url and self.upload_url.startswith('s3://'):
+                self.upload_s3_bucket = self.upload_url[5:]
+            else:
+                user_input = input(_("Please provide the upload bucket: "))
+                self.upload_s3_bucket = user_input.strip('/')
+        return self.upload_s3_bucket
+
+    def prompt_for_upload_s3_endpoint(self):
+        """Should be overridden by policies to determine if an endpoint needs
+        to be provided for upload or not
+        """
+        default_endpoint = self._upload_s3_endpoint
+        if not self.upload_s3_endpoint:
+            msg = (
+                "Please provide the upload endpoint for bucket"
+                f" {self.get_upload_s3_bucket()}"
+                f" (default: {default_endpoint}): "
+            )
+            user_input = input(_(msg))
+            self.upload_s3_endpoint = user_input or default_endpoint
+        return self.upload_s3_endpoint
 
     def prompt_for_upload_user(self):
         """Should be overridden by policies to determine if a user needs to
@@ -342,7 +460,7 @@ class LinuxPolicy(Policy):
         Entry point for sos attempts to upload the generated archive to a
         policy or user specified location.
 
-        Curerntly there is support for HTTPS, SFTP, and FTP. HTTPS uploads are
+        Currently there is support for HTTPS, SFTP, and FTP. HTTPS uploads are
         preferred for policy-defined defaults.
 
         Policies that need to override uploading methods should override the
@@ -388,7 +506,9 @@ class LinuxPolicy(Policy):
             raise Exception("No upload destination provided by policy or by "
                             "--upload-url")
         upload_func = self._determine_upload_type()
-        print(_("Attempting upload to %s" % self.get_upload_url_string()))
+        self.ui_log.info(
+            _(f"Attempting upload to {self.get_upload_url_string()}")
+        )
         return upload_func()
 
     def _determine_upload_type(self):
@@ -401,7 +521,8 @@ class LinuxPolicy(Policy):
         prots = {
             'ftp': self.upload_ftp,
             'sftp': self.upload_sftp,
-            'https': self.upload_https
+            'https': self.upload_https,
+            's3': self.upload_s3
         }
         if self.commons['cmdlineopts'].upload_protocol in prots.keys():
             return prots[self.commons['cmdlineopts'].upload_protocol]
@@ -421,7 +542,7 @@ class LinuxPolicy(Policy):
         :param password: Password for `user` to use for upload
         :type password: ``str``
 
-        :returns: The user/password auth suitable for use in reqests calls
+        :returns: The user/password auth suitable for use in requests calls
         :rtype: ``requests.auth.HTTPBasicAuth()``
         """
         if not user:
@@ -431,6 +552,73 @@ class LinuxPolicy(Policy):
 
         return requests.auth.HTTPBasicAuth(user, password)
 
+    def get_upload_s3_access_key(self):
+        """Helper function to determine if we should use the policy default
+        upload access key or one provided by the user
+
+        :returns: The access_key to use for upload
+        :rtype: ``str``
+        """
+        return (os.getenv('SOSUPLOADS3ACCESSKEY', None) or
+                self.upload_s3_access_key or
+                self._upload_s3_access_key)
+
+    def get_upload_s3_endpoint(self):
+        """Helper function to determine if we should use the policy default
+        upload endpoint or one provided by the user
+
+        :returns: The S3 Endpoint to use for upload
+        :rtype: ``str``
+        """
+        if not self.upload_s3_endpoint:
+            self.prompt_for_upload_s3_endpoint()
+        return self.upload_s3_endpoint
+
+    def get_upload_s3_region(self):
+        """Helper function to determine if we should use the policy default
+        upload region or one provided by the user
+
+        :returns: The S3 region to use for upload
+        :rtype: ``str``
+        """
+        return self.upload_s3_region or self._upload_s3_region
+
+    def get_upload_s3_bucket(self):
+        """Helper function to determine if we should use the policy default
+        upload bucket or one provided by the user
+
+        :returns: The S3 bucket to use for upload
+        :rtype: ``str``
+        """
+        if self.upload_url and self.upload_url.startswith('s3://'):
+            bucket_and_prefix = self.upload_url[5:].split('/', 1)
+            self.upload_s3_bucket = bucket_and_prefix[0]
+            if len(bucket_and_prefix) > 1:
+                self.upload_s3_object_prefix = bucket_and_prefix[1]
+        if not self.upload_s3_bucket:
+            self.prompt_for_upload_s3_bucket()
+        return self.upload_s3_bucket or self._upload_s3_bucket
+
+    def get_upload_s3_object_prefix(self):
+        """Helper function to determine if we should use the policy default
+        upload object prefix or one provided by the user
+
+        :returns: The S3 object prefix to use for upload
+        :rtype: ``str``
+        """
+        return self.upload_s3_object_prefix or self._upload_s3_object_prefix
+
+    def get_upload_s3_secret_key(self):
+        """Helper function to determine if we should use the policy default
+        upload secret key or one provided by the user
+
+        :returns: The S3 secret key to use for upload
+        :rtype: ``str``
+        """
+        return (os.getenv('SOSUPLOADS3SECRETKEY', None) or
+                self.upload_s3_secret_key or
+                self._upload_s3_secret_key)
+
     def get_upload_url(self):
         """Helper function to determine if we should use the policy default
         upload url or one provided by the user
@@ -438,6 +626,14 @@ class LinuxPolicy(Policy):
         :returns: The URL to use for upload
         :rtype: ``str``
         """
+        if not self.upload_url and (
+            self.upload_s3_bucket and
+            self.upload_s3_access_key and
+            self.upload_s3_secret_key
+        ):
+            bucket = self.get_upload_s3_bucket()
+            prefix = self.get_upload_s3_object_prefix()
+            self._upload_url = f"s3://{bucket}/{prefix}"
         return self.upload_url or self._upload_url
 
     def get_upload_url_string(self):
@@ -724,6 +920,71 @@ class LinuxPolicy(Policy):
             return True
         except IOError:
             raise Exception("could not open archive file")
+
+    def upload_s3(self, endpoint=None, region=None, bucket=None, prefix=None,
+                  access_key=None, secret_key=None):
+        """Attempts to upload the archive to an S3 bucket.
+
+        :param endpoint: The S3 endpoint to upload to
+        :type endpoint: str
+
+        :param region: The S3 region to upload to
+        :type region: str
+
+        :param bucket: The name of the S3 bucket to upload to
+        :type bucket: str
+
+        :param prefix: The prefix for the S3 object/key
+        :type prefix: str
+
+        :param access_key: The access key for the S3 bucket
+        :type access_key: str
+
+        :param secret_key: The secret key for the S3 bucket
+        :type secret_key: str
+
+        :returns: True if upload is successful
+        :rtype: bool
+
+        :raises: Exception if upload is unsuccessful
+        """
+        if not BOTO3_LOADED:
+            raise Exception("Unable to upload due to missing python boto3 "
+                            "library")
+
+        if not endpoint:
+            endpoint = self.get_upload_s3_endpoint()
+        if not region:
+            region = self.get_upload_s3_region()
+
+        if not bucket:
+            bucket = self.get_upload_s3_bucket().strip('/')
+
+        if not prefix:
+            prefix = self.get_upload_s3_object_prefix()
+            if prefix != '' and prefix.startswith('/'):
+                prefix = prefix[1:]
+            if prefix != '' and not prefix.endswith('/'):
+                prefix = f'{prefix}/' if prefix else ''
+
+        if not access_key:
+            access_key = self.get_upload_s3_access_key()
+
+        if not secret_key:
+            secret_key = self.get_upload_s3_secret_key()
+
+        s3_client = boto3.client('s3', endpoint_url=endpoint,
+                                 region_name=region,
+                                 aws_access_key_id=access_key,
+                                 aws_secret_access_key=secret_key)
+
+        try:
+            key = prefix + self.upload_archive_name.split('/')[-1]
+            s3_client.upload_file(self.upload_archive_name,
+                                  bucket, key)
+            return True
+        except Exception as e:
+            raise Exception(f"Failed to upload to S3: {str(e)}") from e
 
     def set_sos_prefix(self):
         """If sosreport commands need to always be prefixed with something,

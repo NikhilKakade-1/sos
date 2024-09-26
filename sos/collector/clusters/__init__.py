@@ -41,6 +41,9 @@ class Cluster():
     :cvar sos_plugins: Which plugins to forcibly enable for node reports
     :vartype sos_plugins: ``list``
 
+    :cvar sos_options: Options to pass to report on every node
+    :vartype sos_options: ``dict``
+
     :cvar sos_plugin_options: Plugin options to forcibly set for nodes
     :vartype sos_plugin_options: ``dict``
 
@@ -54,6 +57,7 @@ class Cluster():
     option_list = []
     packages = ('',)
     sos_plugins = []
+    sos_options = {}
     sos_plugin_options = {}
     sos_preset = ''
     cluster_name = None
@@ -115,6 +119,10 @@ class Cluster():
                 "Uses the following sos preset: %s" % cls.sos_preset,
                 newline=False
             )
+
+        if cls.sos_options:
+            _opts = ', '.join(f'--{k} {v}' for k, v in cls.sos_options.items())
+            section.add_text(f"Sets the following sos options: {_opts}")
 
         if cls.sos_plugins:
             section.add_text(
@@ -212,7 +220,7 @@ class Cluster():
 
     def log_warn(self, msg):
         """Used to print warning messages"""
-        self.soslog.warn(self._fmt_msg(msg))
+        self.soslog.warning(self._fmt_msg(msg))
 
     def get_option(self, option):
         """
@@ -286,7 +294,8 @@ class Cluster():
         """
         return node.address == self.primary.address
 
-    def exec_primary_cmd(self, cmd, need_root=False):
+    def exec_primary_cmd(self, cmd, need_root=False, timeout=180,
+                         use_shell='auto'):
         """Used to retrieve command output from a (primary) node in a cluster
 
         :param cmd: The command to run
@@ -295,11 +304,17 @@ class Cluster():
         :param need_root: Does the command require root privileges
         :type need_root: ``bool``
 
+        :param timeout:  Amount of time to allow cmd to run in seconds
+        :type timeout: ``int``
+
+        :param use_shell:   Does the command required execution within a shell?
+        :type use_shell:    ``auto`` or ``bool``
+
         :returns: The output and status of `cmd`
         :rtype: ``dict``
         """
-        pty = self.primary.local is False
-        res = self.primary.run_command(cmd, get_pty=pty, need_root=need_root)
+        res = self.primary.run_command(cmd, need_root=need_root,
+                                       use_shell=use_shell, timeout=timeout)
         if res['output']:
             res['output'] = res['output'].replace('Password:', '')
         return res
@@ -392,13 +407,14 @@ class Cluster():
         """
         try:
             nodes = self.get_nodes()
-        except Exception as e:
-            self.log_error('Cluster failed to enumerate nodes: %s' % e)
-            raise
+        except Exception as err:
+            raise Exception(f"Cluster failed to enumerate nodes: {err}")
         if isinstance(nodes, list):
             node_list = [n.strip() for n in nodes if n]
         elif isinstance(nodes, str):
             node_list = [n.split(',').strip() for n in nodes]
+        else:
+            raise Exception(f"Cluster returned unexpected node list: {nodes}")
         node_list = list(set(node_list))
         for node in node_list:
             if node.startswith(('-', '_', '(', ')', '[', ']', '/', '\\')):

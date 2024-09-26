@@ -1,3 +1,4 @@
+import logging
 import os
 import platform
 import time
@@ -68,6 +69,11 @@ class Policy():
     :param probe_runtime: Should the Policy try to load a ContainerRuntime
     :type probe_runtime: ``bool``
 
+    :param remote_exec:     If this policy is loaded for a remote node, use
+                            this to facilitate executing commands via the
+                            SoSTransport in use
+    :type remote_exec:      ``SoSTranport.run_command()``
+
     :cvar distro: The name of the distribution the Policy represents
     :vartype distro: ``str``
 
@@ -122,6 +128,8 @@ any third party.
         super(SubClass, self).__init__(). Policies that require runtime
         tests to construct PATH must call self.set_exec_path() after
         modifying PATH in their own initializer."""
+        self.soslog = logging.getLogger('sos')
+        self.ui_log = logging.getLogger('sos_ui')
         self._parse_uname()
         self.case_id = None
         self.probe_runtime = probe_runtime
@@ -170,6 +178,7 @@ any third party.
         override subclass-specific paths
         """
         return [
+            '*.egg',
             '*.pyc',
             '*.pyo',
             '*.swp'
@@ -216,7 +225,7 @@ any third party.
 
             * name  - the short hostname of the system
             * label - the label given by --label
-            * case  - the case id given by --case-id or --ticker-number
+            * case  - the case id given by --case-id
             * rand  - a random string of 7 alpha characters
 
         Note that if a datestamp is needed, the substring should be set
@@ -423,44 +432,42 @@ any third party.
                          file for this run
         :type map_file: ``str``
         """
-        # Logging is already shutdown and all terminal output must use the
-        # print() call.
+        # Logging is shut down, but there are some edge cases where automation
+        # does not capture printed output (e.g. avocado CI). Use the ui_log to
+        # still print to console in this case.
 
         # make sure a report exists
         if not archive and not directory:
             return False
 
-        self._print()
-
         if map_file:
-            self._print(_("A mapping of obfuscated elements is available at"
-                          "\n\t%s\n" % map_file))
+            self.ui_log.info(
+                _(f"\nA mapping of obfuscated elements is available at"
+                  f"\n\t{map_file}")
+            )
 
         if archive:
-            self._print(_("Your sosreport has been generated and saved "
-                          "in:\n\t%s\n") % archive, always=True)
-            self._print(_(" Size\t%s") %
-                        get_human_readable(archivestat.st_size))
-            self._print(_(" Owner\t%s") %
-                        getpwuid(archivestat.st_uid).pw_name)
+            self.ui_log.info(
+                _(f"\nYour sosreport has been generated and saved in:"
+                  f"\n\t{archive}\n")
+            )
+            self.ui_log.info(
+                _(f" Size\t{get_human_readable(archivestat.st_size)}")
+            )
+            self.ui_log.info(
+                _(f" Owner\t{getpwuid(archivestat.st_uid).pw_name}")
+            )
         else:
-            self._print(_("Your sosreport build tree has been generated "
-                          "in:\n\t%s\n") % directory, always=True)
+            self.ui_log.info(
+                _(f"Your sosreport build tree has been generated in:"
+                  f"\n\t{directory}\n")
+            )
         if checksum:
-            self._print(" " + self.get_preferred_hash_name() + "\t" + checksum)
-            self._print()
-            self._print(_("Please send this file to your support "
-                          "representative."))
-        self._print()
-
-    def _print(self, msg=None, always=False):
-        """A wrapper around print that only prints if we are not running in
-        quiet mode"""
-        if always or not self.commons['cmdlineopts'].quiet:
-            if msg:
-                print(msg)
-            else:
-                print()
+            self.ui_log.info(f" {self.get_preferred_hash_name()}\t{checksum}")
+            self.ui_log.info(
+                _("\nPlease send this file to your support representative.\n")
+            )
+        return None
 
     def get_msg(self):
         """This method is used to prepare the preamble text to display to

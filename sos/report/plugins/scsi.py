@@ -47,7 +47,8 @@ class Scsi(Plugin, IndependentPlugin):
                     devsg = line.split()[-1]
                     self.add_cmd_output("sg_ses -p2 -b1 %s" % devsg)
 
-        self.add_cmd_output("lsscsi -i", suggest_filename="lsscsi")
+        self.add_cmd_output("lsscsi -i", suggest_filename="lsscsi",
+                            tags="lsscsi")
 
         self.add_cmd_output([
             "sg_map -x",
@@ -61,14 +62,13 @@ class Scsi(Plugin, IndependentPlugin):
         ])
 
         scsi_hosts = glob("/sys/class/scsi_host/*")
-        self.add_blockdev_cmd("udevadm info -a %(dev)s", devices=scsi_hosts,
-                              prepend_path='/sys/class/scsi_host')
+        self.add_device_cmd("udevadm info -a %(dev)s", devices=scsi_hosts)
 
-        self.add_blockdev_cmd([
+        self.add_device_cmd([
             "sg_persist --in -k -d %(dev)s",
             "sg_persist --in -r -d %(dev)s",
             "sg_persist --in -s -d %(dev)s",
             "sg_inq %(dev)s"
-        ], whitelist=['sd.*'])
+        ], devices='block', whitelist=['sd.*'])
 
 # vim: set et ts=4 sw=4 :

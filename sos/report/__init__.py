@@ -18,7 +18,8 @@ from datetime import datetime
 import glob
 import sos.report.plugins
 from sos.utilities import (ImporterHelper, SoSTimeoutError, bold,
-                           sos_get_command_output, TIMEOUT_DEFAULT)
+                           sos_get_command_output, TIMEOUT_DEFAULT, listdir,
+                           is_executable)
 from shutil import rmtree
 import hashlib
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
@@ -86,10 +87,12 @@ class SoSReport(SoSComponent):
         'keep_binary_files': False,
         'desc': '',
         'domains': [],
+        'disable_parsers': [],
         'dry_run': False,
         'estimate_only': False,
         'experimental': False,
         'enable_plugins': [],
+        'journal_size': 100,
         'keywords': [],
         'keyword_file': None,
         'plugopts': [],
@@ -98,6 +101,7 @@ class SoSReport(SoSComponent):
         'list_presets': False,
         'list_profiles': False,
         'log_size': 25,
+        'low_priority': False,
         'map_file': '/etc/sos/cleaner/default_mapping',
         'skip_commands': [],
         'skip_files': [],
@@ -125,6 +129,12 @@ class SoSReport(SoSComponent):
         'upload_method': 'auto',
         'upload_no_ssl_verify': False,
         'upload_protocol': 'auto',
+        'upload_s3_endpoint': None,
+        'upload_s3_region': None,
+        'upload_s3_bucket': None,
+        'upload_s3_access_key': None,
+        'upload_s3_secret_key': None,
+        'upload_s3_object_prefix': None,
         'add_preset': '',
         'del_preset': ''
     }
@@ -138,7 +148,6 @@ class SoSReport(SoSComponent):
         self.archive = None
         self._args = args
         self.sysroot = "/"
-        self.preset = None
         self.estimated_plugsizes = {}
 
         self.print_header()
@@ -148,28 +157,6 @@ class SoSReport(SoSComponent):
 
         # add a manifest section for report
         self.report_md = self.manifest.components.add_section('report')
-
-        # user specified command line preset
-        if self.opts.preset != self.arg_defaults["preset"]:
-            self.preset = self.policy.find_preset(self.opts.preset)
-            if not self.preset:
-                sys.stderr.write("Unknown preset: '%s'\n" % self.opts.preset)
-                self.preset = self.policy.probe_preset()
-                self.opts.list_presets = True
-
-        # --preset=auto
-        if not self.preset:
-            self.preset = self.policy.probe_preset()
-        # now merge preset options to self.opts
-        self.opts.merge(self.preset.opts)
-        # re-apply any cmdline overrides to the preset
-        self.opts = self.apply_options_from_cmdline(self.opts)
-        if hasattr(self.preset.opts, 'verbosity') and \
-                self.preset.opts.verbosity > 0:
-            print('\nWARNING: It is not recommended to set verbosity via the '
-                  'preset as it might have\nunforseen consequences for your '
-                  'report logs.\n')
-            self._setup_logging()
 
         self._set_directories()
 
@@ -189,8 +176,8 @@ class SoSReport(SoSComponent):
             self._exit(1)
 
         self._check_container_runtime()
-        self._get_hardware_devices()
         self._get_namespaces()
+        self._get_hardware_devices()
 
     @classmethod
     def add_parser_options(cls, parser):
@@ -239,6 +226,10 @@ class SoSReport(SoSComponent):
         report_grp.add_argument("-e", "--enable-plugins", action="extend",
                                 dest="enable_plugins", type=str,
                                 help="enable these plugins", default=[])
+        report_grp.add_argument("--journal-size", type=int, default=100,
+                                dest="journal_size",
+                                help="limit the size of collected journals "
+                                     "in MiB")
         report_grp.add_argument("-k", "--plugin-option", "--plugopts",
                                 action="extend",
                                 dest="plugopts", type=str,
@@ -260,7 +251,11 @@ class SoSReport(SoSComponent):
         report_grp.add_argument("--log-size", action="store", dest="log_size",
                                 type=int, default=25,
                                 help="limit the size of collected logs "
-                                     "(in MiB)")
+                                     "(not journals) in MiB")
+        report_grp.add_argument("--low-priority", action="store_true",
+                                default=False,
+                                help="generate report with low system priority"
+                                )
         report_grp.add_argument("--namespaces", default=None,
                                 help="limit number of namespaces to collect "
                                      "output for - 0 means unlimited")
@@ -323,8 +318,21 @@ class SoSReport(SoSComponent):
         report_grp.add_argument("--upload-no-ssl-verify", default=False,
                                 action='store_true',
                                 help="Disable SSL verification for upload url")
+        report_grp.add_argument("--upload-s3-endpoint", default=None,
+                                help="Endpoint to upload to for S3 bucket")
+        report_grp.add_argument("--upload-s3-region", default=None,
+                                help="Region to upload to for S3 bucket")
+        report_grp.add_argument("--upload-s3-bucket", default=None,
+                                help="Name of the S3 bucket to upload to")
+        report_grp.add_argument("--upload-s3-access-key", default=None,
+                                help="Access key for the S3 bucket")
+        report_grp.add_argument("--upload-s3-secret-key", default=None,
+                                help="Secret key for the S3 bucket")
+        report_grp.add_argument("--upload-s3-object-prefix", default=None,
+                                help="Prefix for the S3 object/key")
         report_grp.add_argument("--upload-protocol", default='auto',
-                                choices=['auto', 'https', 'ftp', 'sftp'],
+                                choices=['auto', 'https', 'ftp', 'sftp',
+                                         's3'],
                                 help="Manually specify the upload protocol")
 
         # Group to make add/del preset exclusive
@@ -346,6 +354,10 @@ class SoSReport(SoSComponent):
         cleaner_grp.add_argument('--domains', dest='domains', default=[],
                                  action='extend',
                                  help='Additional domain names to obfuscate')
+        cleaner_grp.add_argument('--disable-parsers', action='extend',
+                                 default=[], dest='disable_parsers',
+                                 help=('Disable specific parsers, so that '
+                                       'those elements are not obfuscated'))
         cleaner_grp.add_argument('--keywords', action='extend', default=[],
                                  dest='keywords',
                                  help='List of keywords to obfuscate')
@@ -429,10 +441,13 @@ class SoSReport(SoSComponent):
 
     def _get_hardware_devices(self):
         self.devices = {
-            'block': self.get_block_devs(),
-            'fibre': self.get_fibre_devs()
+            'storage': {
+                'block': self._get_block_devs(),
+                'fibre': self._get_fibre_devs()
+            },
+            'network': self._get_network_devs(),
+            'namespaced_network': self._get_network_namespace_devices()
         }
-        # TODO: enumerate network devices, preferably with devtype info
 
     def _check_container_runtime(self):
         """Check the loaded container runtimes, and the policy default runtime
@@ -451,7 +466,7 @@ class SoSReport(SoSComponent):
             elif not self.policy.runtimes:
                 msg = ("WARNING: No container runtimes are active, ignoring "
                        "option to set default runtime to '%s'\n" % crun)
-                self.soslog.warn(msg)
+                self.soslog.warning(msg)
             elif crun not in self.policy.runtimes.keys():
                 valid = ', '.join(p for p in self.policy.runtimes.keys()
                                   if p != 'default')
@@ -465,11 +480,11 @@ class SoSReport(SoSComponent):
                     % self.policy.runtimes['default'].name
                 )
 
-    def get_fibre_devs(self):
+    def _get_fibre_devs(self):
         """Enumerate a list of fibrechannel devices on this system so that
         plugins can iterate over them
 
-        These devices are used by add_fibredev_cmd() in the Plugin class.
+        These devices are used by add_device_cmd() in the Plugin class.
         """
         try:
             devs = []
@@ -487,14 +502,25 @@ class SoSReport(SoSComponent):
             self.soslog.error("Could not get fibre device list: %s" % err)
             return []
 
-    def get_block_devs(self):
+    def _get_block_devs(self):
         """Enumerate a list of block devices on this system so that plugins
         can iterate over them
 
-        These devices are used by add_blockdev_cmd() in the Plugin class.
+        These devices are used by add_device_cmd() in the Plugin class.
         """
         try:
-            return os.listdir('/sys/block/')
+            device_list = ["/dev/%s" % d for d in os.listdir('/sys/block')]
+            loop_devices = sos_get_command_output('losetup --all --noheadings')
+            real_loop_devices = []
+            if loop_devices['status'] == 0:
+                for loop_dev in loop_devices['output'].splitlines():
+                    loop_device = loop_dev.split()[0].replace(':', '')
+                    real_loop_devices.append(loop_device)
+            ghost_loop_devs = [dev for dev in device_list
+                               if dev.startswith("loop")
+                               if dev not in real_loop_devices]
+            dev_list = list(set(device_list) - set(ghost_loop_devs))
+            return dev_list
         except Exception as err:
             self.soslog.error("Could not get block device list: %s" % err)
             return []
@@ -503,6 +529,141 @@ class SoSReport(SoSComponent):
         self.namespaces = {
             'network': self._get_network_namespaces()
         }
+
+    def _get_network_devs(self):
+        """Helper to encapsulate network devices probed by sos. Rather than
+        probing lists of distinct device types like we do for storage, we can
+        do some introspection of device enumeration where a single interface
+        may have multiple device types. E.G an 'ethernet' device could also be
+        a bond, and that is pertinent information for device iteration.
+
+        :returns:   A collection of enumerated devices sorted by device type
+        :rtype:     ``dict`` with keys being device types
+        """
+        _devs = {
+            'ethernet': [],
+            'bridge': [],
+            'team': [],
+            'bond': []
+        }
+        try:
+            if is_executable('nmcli', sysroot=self.opts.sysroot):
+                _devs.update(self._get_nmcli_devs())
+            # if nmcli failed for some reason, fallback
+            if not _devs['ethernet']:
+                self.soslog.debug(
+                    'Network devices not enumerated by nmcli. Will attempt to '
+                    'manually compile list of devices.'
+                )
+                _devs.update(self._get_eth_devs())
+                _devs['bridge'] = self._get_bridge_devs()
+        except Exception as err:
+            self.soslog.warning(f"Could not enumerate network devices: {err}")
+        return _devs
+
+    def _get_network_namespace_devices(self):
+        """Enumerate the network devices that exist within each network
+        namespace that exists on the system
+        """
+        _nmdevs = {}
+        for nmsp in self.namespaces['network']:
+            _nmdevs[nmsp] = {
+                'ethernet': self._get_eth_devs(nmsp)
+            }
+        return _nmdevs
+
+    def _get_nmcli_devs(self):
+        """Use nmcli, if available, to enumerate network devices. From this
+        output, manually grok together lists of devices.
+        """
+        _devs = {}
+        try:
+            _ndevs = sos_get_command_output('nmcli --fields DEVICE,TYPE dev')
+            if _ndevs['status'] == 0:
+                for dev in _ndevs['output'].splitlines()[1:]:
+                    dname, dtype = dev.split()
+                    if dtype not in _devs:
+                        _devs[dtype] = [dname]
+                    else:
+                        _devs[dtype].append(dname)
+                    _devs['ethernet'].append(dname)
+            _devs['ethernet'] = list(set(_devs['ethernet']))
+        except Exception as err:
+            self.soslog.debug("Could not parse nmcli devices: %s" % err)
+        return _devs
+
+    def _get_eth_devs(self, namespace=None):
+        """Enumerate a list of ethernet network devices so that plugins can
+        reliably iterate over the same set of devices without doing piecemeal
+        discovery.
+
+        These devices are used by `add_device_cmd()` when `devices` includes
+        "ethernet" or "network".
+
+        :param namespace:   Inspect this existing network namespace, if
+                            provided
+        :type namespace:    ``str``
+
+        :returns:   All valid ethernet devices found, potentially within a
+                    given namespace
+        :rtype:     ``list``
+        """
+        filt_devs = ['bonding_masters']
+        _eth_devs = []
+        if not namespace:
+            try:
+                # Override checking sysroot here, as network devices will not
+                # be under the sysroot in live environments or in containers
+                # that are correctly setup to collect from the host
+                _eth_devs = [
+                    dev for dev in listdir('/sys/class/net', None)
+                    if dev not in filt_devs
+                ]
+            except Exception as err:
+                self.soslog.warning(
+                    f'Failed to manually determine network devices: {err}'
+                )
+        else:
+            try:
+                _nscmd = "ip netns exec %s ls /sys/class/net" % namespace
+                _nsout = sos_get_command_output(_nscmd)
+                if _nsout['status'] == 0:
+                    for _nseth in _nsout['output'].split():
+                        if _nseth not in filt_devs:
+                            _eth_devs.append(_nseth)
+            except Exception as err:
+                self.soslog.warning(
+                    "Could not determine network namespace '%s' devices: %s"
+                    % (namespace, err)
+                )
+        return {
+            'ethernet': _eth_devs,
+            'bond': [bd for bd in _eth_devs if bd.startswith('bond')],
+            'tun': [td for td in _eth_devs if td.startswith('tun')]
+        }
+
+    def _get_bridge_devs(self):
+        """Enumerate a list of bridge devices so that plugins can reliably
+        iterate over the same set of bridges.
+
+        These devices are used by `add_device_cmd()` when `devices` includes
+        "bridge" or "network".
+        """
+        _bridges = []
+        try:
+            _bout = sos_get_command_output('brctl show', timeout=15)
+        except Exception as err:
+            self.soslog.warning("Unable to enumerate bridge devices: %s" % err)
+        if _bout['status'] == 0:
+            for _bline in _bout['output'].splitlines()[1:]:
+                try:
+                    _bridges.append(_bline.split()[0])
+                except Exception as err:
+                    self.soslog.info(
+                        "Could not parse device from line '%s': %s"
+                        % (_bline, err)
+                    )
+        return _bridges
 
     def _get_network_namespaces(self):
         """Enumerate a list of network namespaces on this system so that
@@ -1150,16 +1311,21 @@ class SoSReport(SoSComponent):
                 pool.shutdown(wait=True)
                 pool._threads.clear()
         if self.opts.estimate_only:
-            from pathlib import Path
-            tmpdir_path = Path(self.archive.get_tmp_dir())
-            self.estimated_plugsizes[plugin[1]] = sum(
-                    [f.lstat().st_size for f in tmpdir_path.glob('**/*')])
+            # call "du -s -B1" for the tmp dir to get the disk usage of the
+            # data collected by the plugin - if the command fails, count with 0
+            tmpdir = self.archive.get_tmp_dir()
+            try:
+                du = sos_get_command_output('du -sB1 %s' % tmpdir)
+                self.estimated_plugsizes[plugin[1]] = \
+                    int(du['output'].split()[0])
+            except Exception:
+                self.estimated_plugsizes[plugin[1]] = 0
             # remove whole tmp_dir content - including "sos_commands" and
             # similar dirs that will be re-created on demand by next plugin
             # if needed; it is less error-prone approach than skipping
             # deletion of some dirs but deleting their content
-            for f in os.listdir(self.archive.get_tmp_dir()):
-                f = os.path.join(self.archive.get_tmp_dir(), f)
+            for f in os.listdir(tmpdir):
+                f = os.path.join(tmpdir, f)
                 if os.path.isdir(f) and not os.path.islink(f):
                     rmtree(f)
                 else:
@@ -1181,7 +1347,7 @@ class SoSReport(SoSComponent):
         )
         self.ui_progress(status_line)
         try:
-            plug.collect()
+            plug.collect_plugin()
             # certain exceptions can cause either of these lists to no
             # longer contain the plugin, which will result in sos hanging
             # so we can't blindly call remove() on these two.
@@ -1218,6 +1384,7 @@ class SoSReport(SoSComponent):
             self.handle_exception(plugname, "collect")
         except Exception:
             self.handle_exception(plugname, "collect")
+        return None
 
     def ui_progress(self, status_line):
         if self.opts.verbosity == 0 and not self.opts.batch:
@@ -1279,6 +1446,8 @@ class SoSReport(SoSComponent):
             try:
                 fd = self.get_temp_file()
                 output = class_(report).unicode()
+                # safeguard against non-UTF characters
+                output = output.encode('utf-8', 'replace').decode()
                 fd.write(output)
                 fd.flush()
                 self.archive.add_file(fd, dest=os.path.join('sos_reports',
@@ -1340,6 +1509,8 @@ class SoSReport(SoSComponent):
         directory = None  # report directory path (--build)
         map_file = None  # path of the map file generated for the report
 
+        self.generate_manifest_tag_summary()
+
         # use this instead of self.opts.clean beyond the initial check if
         # cleaning was requested in case SoSCleaner fails for some reason
         do_clean = False
@@ -1363,6 +1534,8 @@ class SoSReport(SoSComponent):
         self._add_sos_logs()
         if self.manifest is not None:
             self.archive.add_final_manifest_data(self.opts.compression_type)
+        # Hide upload passwords in the log files
+        self._obfuscate_upload_passwords()
         # Now, separately clean the log files that cleaner also wrote to
         if do_clean:
             _dir = os.path.join(self.tmpdir, self.archive._name)
@@ -1374,6 +1547,12 @@ class SoSReport(SoSComponent):
                 os.path.join(_dir, 'sos_reports', 'manifest.json'),
                 short_name='manifest.json'
             )
+
+        # Now, just (optionally) pack the report and print work outcome; let
+        # print ui_log to stdout also in quiet mode. For non-quiet mode we
+        # already added the handler
+        if self.opts.quiet:
+            self.add_ui_log_to_stdout()
 
         # print results in estimate mode (to include also just added manifest)
         if self.opts.estimate_only:
@@ -1430,15 +1609,16 @@ class SoSReport(SoSComponent):
                 os.umask(old_umask)
         else:
             if self.opts.encrypt_pass or self.opts.encrypt_key:
-                self.ui_log.warn("\nUnable to encrypt when using --build. "
-                                 "Encryption is only available for archives.")
+                self.ui_log.warning("\nUnable to encrypt when using --build. "
+                                    "Encryption is only available for "
+                                    "archives.")
             # move the archive root out of the private tmp directory.
             directory = self.archive.get_archive_path()
             dir_name = os.path.basename(directory)
+            if do_clean:
+                dir_name = cleaner.obfuscate_string(dir_name)
             try:
                 final_dir = os.path.join(self.sys_tmp, dir_name)
-                if do_clean:
-                    final_dir = cleaner.obfuscate_string(final_dir)
                 os.rename(directory, final_dir)
                 directory = final_dir
             except (OSError, IOError):
@@ -1453,9 +1633,14 @@ class SoSReport(SoSComponent):
             if not archive:
                 print("Creating archive tarball failed.")
             else:
-                # compute and store the archive checksum
-                hash_name = self.policy.get_preferred_hash_name()
-                checksum = self._create_checksum(archive, hash_name)
+                try:
+                    # compute and store the archive checksum
+                    hash_name = self.policy.get_preferred_hash_name()
+                    checksum = self._create_checksum(archive, hash_name)
+                except Exception:
+                    print(_("Error generating archive checksum after "
+                            "archive creation.\n"))
+                    return False
                 try:
                     self._write_checksum(archive, hash_name, checksum)
                 except (OSError, IOError):
@@ -1463,12 +1648,12 @@ class SoSReport(SoSComponent):
 
                 # output filename is in the private tmpdir - move it to the
                 # containing directory.
-                final_name = os.path.join(self.sys_tmp,
-                                          os.path.basename(archive))
+                base_archive = os.path.basename(archive)
                 if do_clean:
-                    final_name = cleaner.obfuscate_string(
-                        final_name.replace('.tar', '-obfuscated.tar')
+                    base_archive = cleaner.obfuscate_string(
+                            base_archive.replace('.tar', '-obfuscated.tar')
                     )
+                final_name = os.path.join(self.sys_tmp, base_archive)
                 # Get stat on the archive
                 archivestat = os.stat(archive)
 
@@ -1500,14 +1685,14 @@ class SoSReport(SoSComponent):
                 except (OSError, IOError):
                     print(_("Error moving checksum file: %s" % archive_hash))
 
-        if not self.opts.build:
-            self.policy.display_results(archive, directory, checksum,
-                                        archivestat, map_file=map_file)
+                self.policy.display_results(archive, directory, checksum,
+                                            archivestat, map_file=map_file)
         else:
             self.policy.display_results(archive, directory, checksum,
                                         map_file=map_file)
 
-        if self.opts.upload or self.opts.upload_url:
+        if (self.opts.upload or self.opts.upload_url
+                or self.opts.upload_s3_endpoint):
             if not self.opts.build:
                 try:
                     self.policy.upload_archive(archive)
@@ -1542,12 +1727,54 @@ class SoSReport(SoSComponent):
         self.report_md.add_field('preset', self.preset.name if self.preset else
                                  'unset')
         self.report_md.add_list('profiles', self.opts.profiles)
+
+        _io_class = 'unknown'
+        if is_executable('ionice'):
+            _io = sos_get_command_output(f"ionice -p {os.getpid()}")
+            if _io['status'] == 0:
+                _io_class = _io['output'].split()[0].strip(':')
+        self.report_md.add_section('priority')
+        self.report_md.priority.add_field('io_class', _io_class)
+        self.report_md.priority.add_field('niceness', os.nice(0))
+
         self.report_md.add_section('devices')
         for key, value in self.devices.items():
-            self.report_md.devices.add_list(key, value)
+            self.report_md.devices.add_field(key, value)
         self.report_md.add_list('enabled_plugins', self.opts.enable_plugins)
         self.report_md.add_list('disabled_plugins', self.opts.skip_plugins)
         self.report_md.add_section('plugins')
+
+    def generate_manifest_tag_summary(self):
+        """Add a section to the manifest that contains a dict summarizing the
+        tags that were created and assigned during this report's creation.
+
+        This summary dict can be used for easier inspection of tagged items by
+        inspection/analyzer projects such as Red Hat Insights. The format of
+        this dict is `{tag_name: [file_list]}`.
+        """
+        def compile_tags(ent, key='filepath'):
+            for tag in ent['tags']:
+                if not ent[key] or not tag:
+                    continue
+                try:
+                    path = tag_summary[tag]
+                except KeyError:
+                    path = []
+                path.extend(
+                    ent[key] if isinstance(ent[key], list) else [ent[key]]
+                )
+                tag_summary[tag] = sorted(list(set(path)))
+
+        tag_summary = {}
+        for plug in self.report_md.plugins:
+            for cmd in plug.commands:
+                compile_tags(cmd)
+            for _file in plug.files:
+                compile_tags(_file, 'files_copied')
+            for collection in plug.collections:
+                compile_tags(collection)
+        self.report_md.add_field('tag_summary',
+                                 dict(sorted(tag_summary.items())))
 
     def _merge_preset_options(self):
         # Log command line options
@@ -1584,16 +1811,18 @@ class SoSReport(SoSComponent):
                 self.list_presets()
                 raise SystemExit
             if self.opts.add_preset:
-                return self.add_preset(self.opts.add_preset)
+                self.add_preset(self.opts.add_preset)
+                raise SystemExit
             if self.opts.del_preset:
-                return self.del_preset(self.opts.del_preset)
+                self.del_preset(self.opts.del_preset)
+                raise SystemExit
             # verify that at least one plug-in is enabled
             if not self.verify_plugins():
-                return False
+                raise SystemExit
 
-            self.add_manifest_data()
             self.batch()
             self.prework()
+            self.add_manifest_data()
             self.setup()
             self.collect()
             if not self.opts.no_env_vars:
